@@ -214,6 +214,13 @@ def _patched_preprocess_mamba(
         # (defense-in-depth — should not happen with allocation-derived
         # writes), skip rather than crash.
         if prev_state_idx < 0 or prev_state_idx >= num_allocated_blocks:
+            logger.warning(
+                "preprocess_mamba: skipping copy, prev_state_idx=%d out of "
+                "range [0, %d) for req %s. Mamba state may be stale.",
+                prev_state_idx,
+                num_allocated_blocks,
+                getattr(req_state, "req_id", "<unknown>"),
+            )
             continue
 
         mamba_utils.collect_mamba_copy_meta(
@@ -319,6 +326,13 @@ def _patched_postprocess_mamba(
 
         # Bounds-check src against the current allocation.
         if src_block_idx < 0 or src_block_idx >= num_allocated_blocks:
+            logger.warning(
+                "postprocess_mamba: skipping copy, src_block_idx=%d out of "
+                "range [0, %d) for req %s. Mamba state may be stale.",
+                src_block_idx,
+                num_allocated_blocks,
+                getattr(req_state, "req_id", "<unknown>"),
+            )
             continue
 
         # accept_token_bias from the sampler's actual count.
