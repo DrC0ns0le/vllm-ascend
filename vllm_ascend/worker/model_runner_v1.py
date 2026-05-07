@@ -1168,6 +1168,51 @@ class NPUModelRunner(GPUModelRunner):
 
         return mm_embeds, is_mm_embed
 
+    def _repair_num_computed_tokens_for_align_mode(self, num_reqs: int) -> None:
+        """CPU-side mirror of update_num_computed_tokens_for_batch_change.
+
+        Needed because the upstream deferred correction
+        (gpu_model_runner.py closure at 1377-1404) gates on
+        valid_sampled_token_count_event, which is only recorded on the
+        fallback drafter path. Under MTP+async on the common drafter
+        path, the closure silently no-ops every step and CPU
+        num_computed_tokens accumulates inflation by
+        (prev_step_drafts - real_accepted_drafts) per step.
+        """
+        if not self.speculative_config or num_reqs == 0:
+            return
+        if not getattr(self, "use_async_spec_decode", False):
+            return
+        if self.cache_config.mamba_cache_mode != "align":
+            return
+
+        prev_positions_np = self.prev_positions.np[:num_reqs]
+        prev_drafts_np = self.prev_num_draft_tokens.np
+        num_accepted_np = self.num_accepted_tokens.np[:num_reqs]
+        num_computed_cpu = self.input_batch.num_computed_tokens_cpu
+
+        for i, req_id in enumerate(self.input_batch.req_ids):
+            prev_pos = int(prev_positions_np[i])
+            if prev_pos < 0:
+                # New request this step; no previous-step inflation.
+                continue
+            prev_drafts = int(prev_drafts_np[prev_pos])
+            if prev_drafts <= 0:
+                # No drafts in the previous step; no inflation to undo.
+                continue
+            # num_accepted_tokens.np is the sampler's count of valid
+            # output tokens for the previous step's sampling, in
+            # range 1..1+num_speculative_tokens. The bonus token is
+            # always counted; accepted drafts = value - 1.
+            real_accepted_drafts = int(num_accepted_np[i]) - 1
+            correction = prev_drafts - real_accepted_drafts
+            if correction == 0:
+                continue
+            req_state = self.requests.get(req_id)
+            if req_state is not None:
+                req_state.num_computed_tokens -= correction
+            num_computed_cpu[i] -= correction
+
     def _build_attn_state(self, num_reqs, num_scheduled_tokens, num_valid_tokens):
         if np.all(self.input_batch.num_computed_tokens_cpu[:num_reqs] == 0):
             attn_state = AscendAttentionState.PrefillNoCache
@@ -1594,6 +1639,15 @@ class NPUModelRunner(GPUModelRunner):
                     if deferred_state_corrections_fn:
                         deferred_state_corrections_fn()
                         deferred_state_corrections_fn = None
+
+                    # Upstream's deferred correction (gpu_model_runner.py
+                    # closure at 1377-1404) only fires on the fallback
+                    # drafter path; on the common path
+                    # (input_fits_in_drafter), it silently no-ops and
+                    # CPU num_computed_tokens stays inflated. Repair it
+                    # here so preprocess_mamba sees correct counts.
+                    self._repair_num_computed_tokens_for_align_mode(num_reqs)
+
                     mamba_utils.preprocess_mamba(
                         scheduler_output,
                         self.kv_cache_config,
