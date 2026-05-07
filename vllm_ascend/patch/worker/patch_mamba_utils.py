@@ -52,6 +52,7 @@
 
 import itertools
 import logging
+import os
 from typing import Any
 
 from vllm.config import CacheConfig
@@ -64,6 +65,39 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState
 from vllm_ascend.ops.triton.batch_memcpy import batch_memcpy_kernel
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Diagnostic instrumentation (set MAMBA_DIAG=1 to enable verbose logging).
+#
+# When enabled:
+#   - Every silent-skip warning dumps full smoking-gun state.
+#   - mamba_state_idx step-over-step jumps != +1 are logged.
+#   - Cross-check between mamba_state_idx and (num_computed_tokens-1)//bs
+#     is logged on disagreement.
+#   - Lines tagged with TP rank for cross-rank comparison.
+#
+# When disabled (default): only the bounds-overrun warnings fire — same as
+# before, no perf cost on the healthy decode path.
+# ---------------------------------------------------------------------------
+
+MAMBA_DIAG = os.environ.get("MAMBA_DIAG", "0") == "1"
+
+
+def _tp_rank() -> int:
+    """Best-effort TP rank for log tagging. Returns -1 if unavailable."""
+    try:
+        from vllm.distributed.parallel_state import get_tp_group
+        return get_tp_group().rank_in_group
+    except Exception:
+        return -1
+
+
+# Per-request, per-rank step counter and last-seen state idx, to detect
+# step-over-step jumps. Keyed by req_id; cleared in preprocess on
+# finished/preempted/resumed.
+_diag_last_state_idx: dict[str, int] = {}
+_diag_step_counter = 0
 
 
 # ---------------------------------------------------------------------------
@@ -111,16 +145,20 @@ def _patched_collect_mamba_copy_meta(
     for mamba_group_id in mamba_group_ids:
         block_ids = req_state.block_ids[mamba_group_id]
 
-        if dest_block_idx >= len(block_ids) or src_block_idx >= len(block_ids):
+        if (dest_block_idx >= len(block_ids)
+                or src_block_idx >= len(block_ids)
+                or dest_block_idx < 0
+                or src_block_idx < 0):
             logger.warning(
-                "Mamba state copy skipped: dest_block_idx=%d src_block_idx=%d "
-                "exceeds block_ids length=%d for req %s (mamba_group_id=%d). "
-                "Possible scheduler/preprocess_mamba mismatch.",
-                dest_block_idx,
-                src_block_idx,
-                len(block_ids),
+                "[MAMBA_DIAG tp=%d step=%d] collect_mamba_copy_meta SKIP "
+                "req=%s grp=%d: dest_block_idx=%d src_block_idx=%d out of "
+                "range [0, %d). accept_token_bias=%d nct=%d",
+                _tp_rank(), _diag_step_counter,
                 getattr(req_state, "req_id", "<unknown>"),
                 mamba_group_id,
+                dest_block_idx, src_block_idx, len(block_ids),
+                accept_token_bias,
+                getattr(req_state, "num_computed_tokens", -1),
             )
             continue
 
@@ -180,6 +218,12 @@ def _patched_preprocess_mamba(
         finished_req_ids, preempted_req_ids, resumed_req_ids
     ):
         mamba_state_idx.pop(req_id, None)
+        if MAMBA_DIAG:
+            _diag_last_state_idx.pop(req_id, None)
+
+    if MAMBA_DIAG:
+        global _diag_step_counter
+        _diag_step_counter += 1
 
     copy_bufs.offset = 0
     primary_group = mamba_group_ids[0]
@@ -188,6 +232,23 @@ def _patched_preprocess_mamba(
             continue
         req_state = requests[req_id]
         prev_state_idx = mamba_state_idx.get(req_id)
+
+        # Diagnostic: cross-check mamba_state_idx against
+        # (num_computed_tokens-1)//block_size. They should agree under
+        # healthy operation. Disagreement localizes whether
+        # num_computed_tokens drift or mamba_state_idx drift came first.
+        if MAMBA_DIAG and prev_state_idx is not None:
+            inferred = (req_state.num_computed_tokens - 1) // block_size
+            if prev_state_idx != inferred:
+                logger.warning(
+                    "[MAMBA_DIAG tp=%d step=%d] req=%s mismatch: "
+                    "mamba_state_idx=%d vs (nct-1)//bs=%d "
+                    "(nct=%d, bs=%d, len(block_ids[0])=%d)",
+                    _tp_rank(), _diag_step_counter, req_id,
+                    prev_state_idx, inferred,
+                    req_state.num_computed_tokens, block_size,
+                    len(req_state.block_ids[primary_group]),
+                )
 
         if prev_state_idx is None:
             # New or resumed request — no previous state. Match upstream:
@@ -208,19 +269,59 @@ def _patched_preprocess_mamba(
 
         mamba_state_idx[req_id] = curr_state_idx
 
+        # Diagnostic: detect step-over-step jumps in curr_state_idx that
+        # aren't 0 (no allocation change) or +1 (one new block). Larger
+        # jumps imply mamba_state_idx was stomped or allocation grew
+        # discontinuously — both are smoking guns for the underlying bug.
+        if MAMBA_DIAG:
+            last = _diag_last_state_idx.get(req_id)
+            if last is not None:
+                delta = curr_state_idx - last
+                if delta not in (0, 1):
+                    logger.warning(
+                        "[MAMBA_DIAG tp=%d step=%d] req=%s "
+                        "curr_state_idx jumped: %d -> %d (delta=%d), "
+                        "len(block_ids[0])=%d, num_speculative_blocks=%d",
+                        _tp_rank(), _diag_step_counter, req_id,
+                        last, curr_state_idx, delta,
+                        num_allocated_blocks, num_speculative_blocks,
+                    )
+            _diag_last_state_idx[req_id] = curr_state_idx
+
         if prev_state_idx == -1 or prev_state_idx == curr_state_idx:
             continue
         # If the loaded prev_state_idx is itself out-of-range
         # (defense-in-depth — should not happen with allocation-derived
         # writes), skip rather than crash.
         if prev_state_idx < 0 or prev_state_idx >= num_allocated_blocks:
-            logger.warning(
-                "preprocess_mamba: skipping copy, prev_state_idx=%d out of "
-                "range [0, %d) for req %s. Mamba state may be stale.",
-                prev_state_idx,
-                num_allocated_blocks,
-                getattr(req_state, "req_id", "<unknown>"),
+            # Smoking-gun dump: capture everything we'd want to know
+            # about why prev_state_idx came out wrong. Always logged
+            # (this is the primary tripwire); MAMBA_DIAG adds the full
+            # block_ids list which can be large.
+            num_scheduled = scheduler_output.num_scheduled_tokens.get(
+                req_id, -1
             )
+            num_draft = len(
+                scheduler_output.scheduled_spec_decode_tokens.get(req_id, [])
+            )
+            num_accepted = int(input_batch.num_accepted_tokens_cpu[i])
+            logger.warning(
+                "[MAMBA_DIAG tp=%d step=%d] preprocess_mamba SKIP req=%s: "
+                "prev_state_idx=%d out of range [0, %d). "
+                "nct=%d bs=%d num_scheduled=%d num_draft=%d "
+                "num_accepted_cpu=%d num_speculative_blocks=%d",
+                _tp_rank(), _diag_step_counter, req_id,
+                prev_state_idx, num_allocated_blocks,
+                req_state.num_computed_tokens, block_size,
+                num_scheduled, num_draft, num_accepted,
+                num_speculative_blocks,
+            )
+            if MAMBA_DIAG:
+                logger.warning(
+                    "[MAMBA_DIAG tp=%d step=%d] req=%s block_ids[0]=%s",
+                    _tp_rank(), _diag_step_counter, req_id,
+                    list(req_state.block_ids[primary_group]),
+                )
             continue
 
         mamba_utils.collect_mamba_copy_meta(
@@ -315,24 +416,34 @@ def _patched_postprocess_mamba(
         # warning rather than guess which block holds the just-completed state.
         if new_running_idx != src_block_idx + 1:
             logger.warning(
-                "postprocess_mamba: running-state slot advanced by %d "
-                "(src=%d, new=%d) for req %s; skipping copy.",
+                "[MAMBA_DIAG tp=%d step=%d] postprocess_mamba SKIP req=%s: "
+                "running-state slot advanced by %d (src=%d, new=%d, "
+                "len(block_ids[0])=%d). Possible mamba_state_idx stomp.",
+                _tp_rank(), _diag_step_counter, req_id,
                 new_running_idx - src_block_idx,
-                src_block_idx,
-                new_running_idx,
-                getattr(req_state, "req_id", "<unknown>"),
+                src_block_idx, new_running_idx, num_allocated_blocks,
             )
             continue
 
         # Bounds-check src against the current allocation.
         if src_block_idx < 0 or src_block_idx >= num_allocated_blocks:
+            num_accepted = int(num_accepted_tokens_cpu[i])
             logger.warning(
-                "postprocess_mamba: skipping copy, src_block_idx=%d out of "
-                "range [0, %d) for req %s. Mamba state may be stale.",
-                src_block_idx,
-                num_allocated_blocks,
-                getattr(req_state, "req_id", "<unknown>"),
+                "[MAMBA_DIAG tp=%d step=%d] postprocess_mamba SKIP req=%s: "
+                "src_block_idx=%d out of range [0, %d). "
+                "nct=%d new_running_idx=%d num_accepted_cpu=%d "
+                "num_speculative_blocks=%d",
+                _tp_rank(), _diag_step_counter, req_id,
+                src_block_idx, num_allocated_blocks,
+                req_state.num_computed_tokens,
+                new_running_idx, num_accepted, num_speculative_blocks,
             )
+            if MAMBA_DIAG:
+                logger.warning(
+                    "[MAMBA_DIAG tp=%d step=%d] req=%s block_ids[0]=%s",
+                    _tp_rank(), _diag_step_counter, req_id,
+                    list(req_state.block_ids[primary_group]),
+                )
             continue
 
         # accept_token_bias from the sampler's actual count.
