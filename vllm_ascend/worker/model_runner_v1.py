@@ -1186,12 +1186,30 @@ class NPUModelRunner(GPUModelRunner):
         if self.cache_config.mamba_cache_mode != "align":
             return
 
+        # Skip when upstream's deferred closure already repaired the
+        # CPU counters this step. The closure runs the correction iff
+        # both _get_valid_sampled_token_count() returned non-empty AND
+        # prev_req_id_to_index is non-empty
+        # (gpu_model_runner.py:1378-1383). The first reduces to
+        # `valid_sampled_token_count_event is not None and
+        # prev_sampled_token_ids is not None`
+        # (_get_valid_sampled_token_count at line 4472). Mirroring
+        # that check here avoids double-correcting on the fallback path.
+        if (
+            self.valid_sampled_token_count_event is not None
+            and self.input_batch.prev_sampled_token_ids is not None
+            and self.input_batch.prev_req_id_to_index
+        ):
+            return
+
         prev_positions_np = self.prev_positions.np[:num_reqs]
         prev_drafts_np = self.prev_num_draft_tokens.np
         num_accepted_np = self.num_accepted_tokens.np[:num_reqs]
         num_computed_cpu = self.input_batch.num_computed_tokens_cpu
 
-        for i, req_id in enumerate(self.input_batch.req_ids):
+        for i, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
+            if req_id is None:
+                continue
             prev_pos = int(prev_positions_np[i])
             if prev_pos < 0:
                 # New request this step; no previous-step inflation.
