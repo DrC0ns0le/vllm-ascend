@@ -93,6 +93,73 @@ def collect_mamba_copy_meta(
     )
 
 
+_orig_preprocess_mamba = mamba_utils.preprocess_mamba
+
+
+def preprocess_mamba(
+    scheduler_output,
+    kv_cache_config,
+    cache_config,
+    mamba_state_idx,
+    input_batch,
+    requests,
+    forward_context,
+    mamba_state_copy_funcs,
+    copy_bufs,
+):
+    # Snapshot CPU-side fields the upstream preprocess_mamba math depends on.
+    try:
+        snap = []
+        for i, req_id in enumerate(input_batch.req_ids):
+            if req_id is None:
+                continue
+            r = requests.get(req_id)
+            if r is None:
+                continue
+            snap.append(
+                (
+                    req_id,
+                    r.num_computed_tokens,
+                    scheduler_output.num_scheduled_tokens.get(req_id),
+                    [len(g) for g in r.block_ids],
+                    input_batch.num_accepted_tokens_cpu[i] if i < len(input_batch.num_accepted_tokens_cpu) else None,
+                    getattr(r, "prev_num_draft_len", None),
+                )
+            )
+        # Only log when something looks off (num_computed_tokens > 1e7
+        # is impossible in practice given max_seq_len=262144) so we don't
+        # spam in the healthy case.
+        for entry in snap:
+            (req_id_, ncomp, nsched, group_lens, naccept, prev_drafts) = entry
+            if isinstance(ncomp, int) and ncomp > 10_000_000:
+                _diag_logger.error(
+                    "MAMBA_DIAG preprocess_entry req=%s "
+                    "num_computed_tokens=%s num_scheduled=%s "
+                    "all_group_lens=%s num_accepted_cpu=%s prev_num_draft_len=%s",
+                    req_id_,
+                    ncomp,
+                    nsched,
+                    group_lens,
+                    naccept,
+                    prev_drafts,
+                )
+    except Exception:
+        _diag_logger.exception("MAMBA_DIAG preprocess_entry diag raised")
+
+    return _orig_preprocess_mamba(
+        scheduler_output,
+        kv_cache_config,
+        cache_config,
+        mamba_state_idx,
+        input_batch,
+        requests,
+        forward_context,
+        mamba_state_copy_funcs,
+        copy_bufs,
+    )
+
+
 mamba_utils.batch_memcpy_kernel = batch_memcpy_kernel
 mamba_utils.batch_memcpy = batch_memcpy
 mamba_utils.collect_mamba_copy_meta = collect_mamba_copy_meta
+mamba_utils.preprocess_mamba = preprocess_mamba
