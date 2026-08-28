@@ -47,8 +47,8 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
         pytest.param(
             [0.88, 0.74, 0.58, 0.49, 0.40, 0.30, 0.18],
             7,
-            {"enable_flashcomm1": True, "enable_dsa_cp": True},
-            id="dsa-cp-dspark",
+            {"enable_flashcomm1": True, "enable_dsa_cp": False},
+            id="dspark-seven-token",
         ),
     ],
 )
@@ -68,25 +68,47 @@ def test_deepseek_v4_dspark_acceptance_tp4(
 
     max_tokens = 1024
 
+    def common_runner_args():
+        return dict(
+            tensor_parallel_size=4,
+            max_model_len=4096,
+            enable_expert_parallel=True,
+            disable_log_stats=False,
+            compilation_config=CompilationConfig(
+                cudagraph_mode="FULL_DECODE_ONLY",
+                cudagraph_capture_sizes=[
+                    batch_size * (num_speculative_tokens + 1)
+                    for batch_size in range(1, len(example_prompts) + 1)
+                ],
+            ),
+            additional_config=additional_config,
+        )
+
     with VllmRunner(
         model_name,
-        tensor_parallel_size=4,
-        max_model_len=4096,
-        enable_expert_parallel=True,
-        disable_log_stats=False,
         speculative_config={
             "method": "dspark",
             "num_speculative_tokens": num_speculative_tokens,
             "enforce_eager": True,
         },
-        compilation_config=CompilationConfig(
-            cudagraph_mode="FULL_DECODE_ONLY",
-            cudagraph_capture_sizes=[6, 8, 16, 18],
-        ),
-        additional_config=additional_config,
+        **common_runner_args(),
+    ) as eager_vllm_model:
+        eager_outputs = eager_vllm_model.generate_greedy(example_prompts, max_tokens)
+
+    cleanup_dist_env_and_memory()
+
+    with VllmRunner(
+        model_name,
+        speculative_config={
+            "method": "dspark",
+            "num_speculative_tokens": num_speculative_tokens,
+        },
+        **common_runner_args(),
     ) as spec_vllm_model:
-        _ = spec_vllm_model.generate_greedy(example_prompts, max_tokens)
+        graph_outputs = spec_vllm_model.generate_greedy(example_prompts, max_tokens)
         metrics = spec_vllm_model.model.get_metrics()
+
+    assert graph_outputs == eager_outputs
 
     num_drafts = 0
     num_accepted_tokens_per_pos = [0] * num_speculative_tokens

@@ -5,14 +5,16 @@ from typing import Any
 
 import torch
 from vllm.config import CUDAGraphMode, VllmConfig, get_layers_from_vllm_config
+from vllm.forward_context import BatchDescriptor, get_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
 from vllm.v1.worker.utils import AttentionGroup
 
-from vllm_ascend.ascend_forward_context import set_ascend_forward_context
+from vllm_ascend.ascend_forward_context import _EXTRA_CTX, set_ascend_forward_context
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.mla_v1 import AscendMLAMetadataBuilder
+from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 from vllm_ascend.ops.triton.spec_decode.utils import copy_and_expand_dflash_and_dspark_inputs_kernel_single_grid
 from vllm_ascend.spec_decode.dflash_proposer import AscendDflashProposer
 from vllm_ascend.transformers_utils.configs.kimi_k3 import (
@@ -72,8 +74,24 @@ class AscendDSparkProposer(AscendDflashProposer):
             dtype=self.dtype,
             device=self.device,
         )
-        # DSpark runs eager only (Ascend cudagraph unsupported on this path).
-        self.use_cuda_graph = False
+        # Keep every existing DSpark implementation eager except the DSV4
+        # block drafter. Qwen and Kimi checkpoints are normalized to distinct
+        # architecture names before the proposer is created.
+        draft_architectures = set(getattr(self.draft_model_config.hf_config, "architectures", ()) or ())
+        target_model_type = getattr(vllm_config.model_config.hf_text_config, "model_type", None)
+        self.supports_dsv4_aclgraph = (
+            target_model_type == "deepseek_v4" and "DSparkDraftModel" in draft_architectures
+        )
+        uses_dynamic_width = getattr(
+            vllm_config.speculative_config,
+            "uses_dynamic_speculative_decoding",
+            lambda: False,
+        )()
+        self.use_cuda_graph = bool(
+            getattr(self, "use_cuda_graph", False)
+            and self.supports_dsv4_aclgraph
+            and not uses_dynamic_width
+        )
         # Max query tokens depend on whether sampling from anchor or not.
         self.max_query_tokens = self.max_batch_size * self.num_query_per_req
         # Position ids for the draft query block [max_query_tokens].
@@ -111,6 +129,10 @@ class AscendDSparkProposer(AscendDflashProposer):
 
         # per-gid block_table (use in proposer)
         self._per_group_block_table_buffers: dict[int, torch.Tensor] = {}
+        # Address-stable graph-owned copies. The runner's active block-table
+        # view can change shape as requests turn over, while an ACLGraph must
+        # keep the captured base address for every replay.
+        self._per_group_graph_block_table_buffers: dict[int, torch.Tensor] = {}
         # per-gid query slot_mapping buffer
         self._per_group_query_slot_mapping_buffers: dict[int, torch.Tensor] = {}
         # per-gid context slot_mapping buffer
@@ -118,6 +140,130 @@ class AscendDSparkProposer(AscendDflashProposer):
 
         # per-layer context slot mappings as a flat list
         self._context_slot_mapping_buffers: list[torch.Tensor | None] | None = None
+
+    def get_graph_num_input_tokens(self, batch_descriptor: BatchDescriptor) -> int:
+        """Map a target ``1 + N`` descriptor to native DSpark width ``N``."""
+        if batch_descriptor.uniform and batch_descriptor.num_reqs is not None:
+            return batch_descriptor.num_reqs * self.num_query_per_req
+        return batch_descriptor.num_tokens
+
+    def get_graph_dispatch_num_tokens(
+        self,
+        num_draft_tokens: int,
+        uniform_decode: bool = True,
+    ) -> int:
+        """Map native DSpark tokens back to the target ``1 + N`` key width."""
+        if not uniform_decode:
+            return num_draft_tokens
+        if num_draft_tokens % self.num_query_per_req != 0:
+            raise ValueError(
+                "DSpark graph input width must contain complete request rows: "
+                f"num_draft_tokens={num_draft_tokens}, row_width={self.num_query_per_req}"
+            )
+        num_reqs = num_draft_tokens // self.num_query_per_req
+        return num_reqs * (self.num_speculative_tokens + 1)
+
+    def get_graph_num_input_tokens_for_runtime(
+        self,
+        batch_descriptor: BatchDescriptor,
+        runtime_mode: CUDAGraphMode,
+        actual_num_tokens: int,
+    ) -> int:
+        """Use native graph padding only when the dispatcher selected FULL."""
+        if runtime_mode != CUDAGraphMode.FULL:
+            return actual_num_tokens
+        return self.get_graph_num_input_tokens(batch_descriptor)
+
+    def pad_query_start_loc_for_graph(
+        self,
+        query_start_loc,
+        num_input_tokens: int,
+        real_num_reqs: int,
+        graph_num_reqs: int,
+    ) -> int:
+        """Pad native-width DSpark metadata by complete inactive rows."""
+        assert graph_num_reqs >= real_num_reqs
+        assert num_input_tokens == graph_num_reqs * self.num_query_per_req
+        assert int(query_start_loc.cpu[real_num_reqs]) == real_num_reqs * self.num_query_per_req
+
+        last_loc = int(query_start_loc.cpu[real_num_reqs])
+        for req_idx in range(real_num_reqs, graph_num_reqs):
+            last_loc += self.num_query_per_req
+            query_start_loc.cpu[req_idx + 1] = last_loc
+
+        assert last_loc == num_input_tokens
+        query_start_loc.copy_to_gpu()
+        return graph_num_reqs
+
+    def pad_attention_inputs_for_graph(self, real_num_reqs: int, graph_num_reqs: int) -> None:
+        """Make padded cache rows inert without touching live request rows."""
+        if graph_num_reqs <= real_num_reqs:
+            return
+        for block_table in self._per_group_block_table_buffers.values():
+            block_table[real_num_reqs:graph_num_reqs].zero_()
+        for slot_mapping in self._per_group_query_slot_mapping_buffers.values():
+            start = real_num_reqs * self.num_query_per_req
+            end = graph_num_reqs * self.num_query_per_req
+            slot_mapping[start:end].fill_(-1)
+
+    def _get_graph_capture_block_table(self, gid: int) -> torch.Tensor:
+        block_table = self._per_group_block_tables.get(gid)
+        if block_table is None:
+            # Runtime tables are not populated during graph warmup. The
+            # runner's per-group dummy table has the same stable allocation.
+            block_table = self.runner.input_batch.block_table[gid].get_device_tensor()
+        return self._publish_graph_block_table(gid, block_table)
+
+    def _publish_graph_block_table(self, gid: int, block_table: torch.Tensor) -> torch.Tensor:
+        """Copy a runtime table into the address-stable DSV4 graph buffer."""
+        if not (
+            getattr(self, "supports_dsv4_aclgraph", False)
+            and getattr(self, "use_cuda_graph", False)
+        ):
+            return block_table
+
+        buffers = getattr(self, "_per_group_graph_block_table_buffers", None)
+        if buffers is None:
+            buffers = {}
+            self._per_group_graph_block_table_buffers = buffers
+        buffer = buffers.get(gid)
+        if buffer is None:
+            capacity_table = block_table
+            input_batch = getattr(getattr(self, "runner", None), "input_batch", None)
+            runner_tables = getattr(input_batch, "block_table", None)
+            if runner_tables is not None:
+                capacity_table = runner_tables[gid].get_device_tensor()
+            buffer = torch.zeros_like(capacity_table)
+            buffers[gid] = buffer
+
+        if block_table.shape[1:] != buffer.shape[1:] or block_table.shape[0] > buffer.shape[0]:
+            raise RuntimeError(
+                "DSpark block table shape changed after graph buffer allocation: "
+                f"gid={gid}, runtime={tuple(block_table.shape)}, "
+                f"captured={tuple(buffer.shape)}"
+            )
+        buffer[: block_table.shape[0]].copy_(block_table)
+        buffer[block_table.shape[0] :].zero_()
+        return buffer
+
+    def _get_draft_attn_causal(self) -> bool:
+        """Return the draft attention mode, defaulting DSV4 to non-causal."""
+        if hasattr(self.model, "get_draft_attn_causal"):
+            return self.model.get_draft_attn_causal()[0]
+        return False
+
+    def _get_draft_attn_state(
+        self,
+        aclgraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+    ) -> AscendAttentionState:
+        """Use the graph-safe speculative tag only for the DSV4 graph path."""
+        if (
+            self.supports_dsv4_aclgraph
+            and self.use_cuda_graph
+            and aclgraph_runtime_mode == CUDAGraphMode.FULL
+        ):
+            return AscendAttentionState.SpecDecoding
+        return AscendAttentionState.ChunkedPrefill
 
     @staticmethod
     def _resolve_kernel_block_size(
@@ -273,7 +419,10 @@ class AscendDSparkProposer(AscendDflashProposer):
         has_num_rejected = num_rejected_tokens_gpu is not None
         primary_gid = getattr(self, "kv_cache_gid", 0)
         self._per_group_block_table_buffers = {
-            attn_group.kv_cache_group_id: self._per_group_block_tables[attn_group.kv_cache_group_id]
+            attn_group.kv_cache_group_id: self._publish_graph_block_table(
+                attn_group.kv_cache_group_id,
+                self._per_group_block_tables[attn_group.kv_cache_group_id],
+            )
             for attn_group in self.draft_attn_groups
         }
         self._context_slot_mapping_buffers = None
@@ -351,13 +500,10 @@ class AscendDSparkProposer(AscendDflashProposer):
         cad.max_seq_len = cad.max_seq_len + self.num_query_per_req
         cad.slot_mapping = self._per_group_query_slot_mapping_buffers[primary_gid][:num_query_total]
         cad.positions = self.positions  # this would be sliced in attention backend
-        if hasattr(self.model, "get_draft_attn_causal"):
-            # Currently, attention causality across draft layers are uniform.
-            cad.causal = self.model.get_draft_attn_causal()[0]
-        else:
-            cad.causal = False
+        # Currently, attention causality across draft layers is uniform.
+        cad.causal = self._get_draft_attn_causal()
         cad.attn_mask = None
-        cad.attn_state = AscendAttentionState.ChunkedPrefill
+        cad.attn_state = self._get_draft_attn_state()
 
         return num_query_total, token_indices_to_sample, cad, None
 
@@ -374,7 +520,12 @@ class AscendDSparkProposer(AscendDflashProposer):
         **kwargs,
     ) -> None:
         num_query_total = num_reqs * self.num_query_per_req
-        num_query_tokens = min(num_query_total if num_reqs > 0 else num_tokens, self.max_query_tokens)
+        if aclgraph_runtime_mode == CUDAGraphMode.FULL and batch_descriptor is not None:
+            num_query_tokens = self.get_graph_num_input_tokens(batch_descriptor)
+        else:
+            num_query_tokens = num_query_total if num_reqs > 0 else num_tokens
+        num_query_tokens = min(num_query_tokens, self.max_query_tokens)
+        num_context_tokens = min(num_tokens, self.max_num_tokens)
 
         (
             num_input_tokens,
@@ -385,14 +536,82 @@ class AscendDSparkProposer(AscendDflashProposer):
         if not self.use_cuda_graph:
             aclgraph_runtime_mode = CUDAGraphMode.NONE
 
-        context_positions = self._context_positions_buffer[:num_input_tokens]
-        context_states = self.hidden_states[:num_input_tokens]
+        context_positions = self._context_positions_buffer[:num_context_tokens]
+        context_states = self.hidden_states[:num_context_tokens]
 
-        self.token_indices_to_sample.fill_(0)
-        self._pad_draft_buffers(num_query_total, num_input_tokens)
+        multi_steps_attn_metadata: list[dict[str, Any]] = []
+        graph_num_reqs = num_reqs
+        if aclgraph_runtime_mode == CUDAGraphMode.FULL and self.draft_attn_groups:
+            assert batch_descriptor is not None
+            graph_num_reqs = batch_descriptor.num_reqs or num_reqs
+            assert num_input_tokens == graph_num_reqs * self.num_query_per_req
+            assert num_input_tokens <= self.max_query_tokens
+
+            self.query_start_loc.cpu[: graph_num_reqs + 1].copy_(
+                torch.from_numpy(self.token_arange_np[: graph_num_reqs + 1]) * self.num_query_per_req
+            )
+            self.query_start_loc.copy_to_gpu()
+            self.query_start_loc_group[0][: graph_num_reqs + 1].copy_(
+                self.query_start_loc.gpu[: graph_num_reqs + 1]
+            )
+
+            self.seq_lens_group[0][:graph_num_reqs].copy_(self.runner.seq_lens[:graph_num_reqs])
+            self.seq_lens_group[0][:graph_num_reqs].clamp_min_(1)
+            graph_seq_lens = self.seq_lens_group[0][:graph_num_reqs]
+            graph_seq_lens_cpu = self.runner.optimistic_seq_lens_cpu[:graph_num_reqs].clone()
+            graph_seq_lens_cpu.clamp_min_(1)
+
+            self._dflash_num_context = 0
+            self._pad_draft_buffers(0, num_input_tokens)
+            self.token_indices_to_sample[:num_input_tokens].copy_(self.arange[:num_input_tokens])
+            self.token_indices_to_sample[num_input_tokens:].fill_(0)
+
+            per_layer_attn_metadata: dict[str, Any] = {}
+            causal = self._get_draft_attn_causal()
+            graph_attn_state = self._get_draft_attn_state(aclgraph_runtime_mode)
+            for attn_group in self.draft_attn_groups:
+                gid = attn_group.kv_cache_group_id
+                block_table = self._get_graph_capture_block_table(gid)
+                assert block_table.shape[0] >= graph_num_reqs
+                self._per_group_block_table_buffers[gid] = block_table
+
+                common_attn_metadata = AscendCommonAttentionMetadata(
+                    query_start_loc=self.query_start_loc_group[0][: graph_num_reqs + 1],
+                    query_start_loc_cpu=self.query_start_loc.cpu[: graph_num_reqs + 1],
+                    seq_lens_cpu=graph_seq_lens_cpu,
+                    _seq_lens_cpu=graph_seq_lens_cpu,
+                    seq_lens_cpu_upper_bound=graph_seq_lens_cpu,
+                    seq_lens=graph_seq_lens,
+                    num_reqs=graph_num_reqs,
+                    num_actual_tokens=num_input_tokens,
+                    num_input_tokens=num_input_tokens,
+                    max_query_len=self.num_query_per_req,
+                    max_seq_len=0,
+                    slot_mapping=self._per_group_query_slot_mapping_buffers[gid][:num_input_tokens],
+                    positions=self.positions,
+                    attn_state=graph_attn_state,
+                    causal=causal,
+                    is_prefilling=torch.zeros(graph_num_reqs, dtype=torch.bool),
+                    block_table_tensor=block_table[:graph_num_reqs],
+                )
+                metadata = attn_group.get_metadata_builder().build_for_drafting(
+                    common_attn_metadata,
+                    draft_index=1,
+                    block_size=self._per_group_kernel_block_sizes[gid],
+                )
+                if hasattr(metadata, "attn_mask") and not causal:
+                    metadata.attn_mask = None
+                metadata.attn_state = graph_attn_state
+                for layer_name in attn_group.layer_names:
+                    per_layer_attn_metadata[layer_name] = metadata
+            multi_steps_attn_metadata.append(per_layer_attn_metadata)
+
+        if not multi_steps_attn_metadata:
+            self.token_indices_to_sample.fill_(0)
+            self._pad_draft_buffers(num_query_total, num_input_tokens)
 
         with set_ascend_forward_context(
-            None,
+            multi_steps_attn_metadata[0] if multi_steps_attn_metadata else None,
             self.vllm_config,
             num_tokens=num_input_tokens,
             num_tokens_across_dp=num_tokens_across_dp,
@@ -401,7 +620,7 @@ class AscendDSparkProposer(AscendDflashProposer):
             batch_descriptor=batch_descriptor,
             aclgraph_runtime_mode=aclgraph_runtime_mode,
             is_draft_model=True,
-            draft_attn_metadatas=[],
+            draft_attn_metadatas=multi_steps_attn_metadata,
         ):
             if is_profile:
                 self.model.precompute_and_store_context_kv(context_states, context_positions)
@@ -412,13 +631,21 @@ class AscendDSparkProposer(AscendDflashProposer):
                 )
 
             else:
-                self._dflash_num_context = num_input_tokens
+                self._dflash_num_context = num_context_tokens
                 self._runnable(
                     num_input_tokens=num_input_tokens,
-                    batch_size=num_reqs,
-                    token_indices_to_sample=self.token_indices_to_sample[: num_reqs * self.num_speculative_tokens],
+                    batch_size=graph_num_reqs,
+                    token_indices_to_sample=self.token_indices_to_sample[:num_input_tokens],
                     target_positions=self._get_positions(num_input_tokens),
                     inputs_embeds=None,
-                    multi_steps_attn_metadata=[],
+                    multi_steps_attn_metadata=multi_steps_attn_metadata,
                     num_tokens=num_input_tokens,
+                )
+
+            forward_context = get_forward_context()
+            if forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL and not _EXTRA_CTX.capturing:
+                self._update_full_graph_params(
+                    forward_context,
+                    num_input_tokens,
+                    multi_steps_attn_metadata,
                 )

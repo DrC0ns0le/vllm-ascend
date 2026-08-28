@@ -13,6 +13,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from vllm.v1.metrics.stats import PrefixCacheStats, PrefillStats, PromptTokenStats
 
 from vllm_ascend.patch.platform import patch_async_scheduler as async_backport
 from vllm_ascend.patch.platform import patch_balance_schedule as balance_backport
@@ -215,6 +216,62 @@ def test_kv_delivery_schedule_has_no_balance_dependency():
     assert "assert request_queue is not None" in source
 
 
+def test_local_prefix_hit_updates_both_metric_families():
+    """The scheduler's two admission records feed both public metric sets."""
+    prompt_prefill = PrefillStats()
+    prompt_prefill.set(
+        num_prompt_tokens=32,
+        num_local_cached_tokens=16,
+        num_external_cached_tokens=0,
+    )
+    prompt_tokens = PromptTokenStats()
+    prompt_tokens.update_from_output(prompt_prefill)
+
+    prefix_cache = PrefixCacheStats()
+    prefix_cache.record(num_tokens=32, num_hits=16, preempted=False)
+
+    assert prompt_tokens.get_by_source("local_cache_hit") == 16
+    assert prefix_cache.queries == 32
+    assert prefix_cache.hits == 16
+
+
+@pytest.mark.parametrize(
+    "scheduler_cls",
+    [backport.KVDeliveryScheduler, balance_backport.BalanceScheduler],
+)
+def test_prefix_cache_metrics_are_recorded_only_after_admission(scheduler_cls):
+    """Local-hit prompt attribution and APC stats share the admission gate."""
+    source = inspect.getsource(scheduler_cls.schedule)
+    prompt_stats = source.index("request.prefill_stats.set(")
+    allocation = source.index("new_blocks = self.kv_cache_manager.allocate_slots(", prompt_stats)
+    allocation_failure = source.index("if new_blocks is None:", allocation)
+    prefix_stats = source.index("self.kv_cache_manager.record_prefix_cache_stats(", allocation)
+
+    assert "num_local_cached_tokens=num_new_local_computed_tokens" in source
+    assert "request, num_new_local_computed_tokens" in source[prefix_stats : prefix_stats + 180]
+    assert prompt_stats < allocation < allocation_failure < prefix_stats
+    assert "self.kv_cache_manager.record_prefix_cache_stats(" not in source[
+        allocation_failure:prefix_stats
+    ]
+    assert "self.kv_cache_manager.prefix_cache_stats.record(" not in source
+
+
+@pytest.mark.parametrize(
+    "scheduler_cls",
+    [backport.KVDeliveryScheduler, balance_backport.BalanceScheduler],
+)
+def test_connector_hybrid_lookup_matches_verified_vllm_behavior(scheduler_cls):
+    source = inspect.getsource(scheduler_cls.schedule)
+    connector_lookup = source.index("self.kv_cache_manager.get_computed_blocks_for_connector(")
+    external_lookup = source.index("self.connector.get_num_new_matched_tokens(", connector_lookup)
+    divergence = source.index("if hit_diverged and num_external_computed_tokens == 0:", external_lookup)
+    fallback = source.index("self.kv_cache_manager.get_computed_blocks(request)", divergence)
+
+    assert connector_lookup < external_lookup < divergence < fallback
+    assert "find_longest_cache_hit_per_group" not in source
+    assert "did_prefix_cache_lookup = True" in source
+
+
 def test_48245_waits_for_deliverable_stale_output_before_resume():
     source = inspect.getsource(backport.KVDeliveryScheduler.schedule)
 
@@ -260,6 +317,10 @@ def _kv_schedule_body_ast(source: str) -> str:
             self.generic_visit(node)
             if isinstance(node.func, ast.Attribute) and node.func.attr == "_preempt_request":
                 node.keywords = [kw for kw in node.keywords if kw.arg != "drop_stale_output"]
+            if isinstance(node.func, ast.Name) and node.func.id == "SchedulerOutput":
+                # The release-compatible backport intentionally omits the
+                # newer encoder-cache manager metadata output field.
+                node.keywords = [kw for kw in node.keywords if kw.arg != "ec_manager_metadata"]
             return node
 
         def visit_If(self, node: ast.If):  # noqa: N802

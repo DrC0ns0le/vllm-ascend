@@ -522,6 +522,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         self.speculative_config = vllm_config.speculative_config
         self.decode_threshold = 1
         self.spec_slot_mapping = None
+        self.dspark_swa_indices_buffer: torch.Tensor | None = None
         if get_ascend_device_type() in {AscendDeviceType.A5}:
             self.slot_mapping_shape = (vllm_config.scheduler_config.max_num_batched_tokens,)  # type: ignore
         else:
@@ -1244,10 +1245,9 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         **kwargs,
     ) -> AscendDSADecodeMetadata:
         assert self.compressor_ratio <= 1, "vLLM-Ascend only support SWA-layer for Deepseek-V4 now."
-        # DSpark drafting operates on the paged SWA cache, whose block size is the
-        # kv_cache_spec block size passed by the proposer (== swa_cache_layer.block_size),
-        # NOT this builder's default MLA block size (128). Honor the kwarg so the
-        # slot_mapping / dspark_swa_indices geometry matches the real cache layout.
+        # DSpark drafting operates on the logical paged-SWA view. In hybrid KV
+        # layouts its kernel block size can be smaller than the KV manager's
+        # physical page size, so honor the per-group value from the proposer.
         self.block_size = kwargs.get("block_size", self.block_size)
         num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = split_decodes_and_prefills(
             common_attn_metadata, decode_threshold=self.decode_threshold
@@ -1305,6 +1305,37 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             sin=sin,
             hadamard=None,
         )
+
+    def _store_dspark_swa_indices(
+        self,
+        computed_indices: torch.Tensor,
+        num_decode_tokens: int,
+    ) -> torch.Tensor:
+        """Publish DSpark indices through one address-stable graph buffer."""
+        if self.dspark_swa_indices_buffer is None:
+            self.dspark_swa_indices_buffer = computed_indices.new_full(
+                (
+                    self.slot_mapping_shape[0],
+                    computed_indices.shape[1],
+                    computed_indices.shape[2],
+                ),
+                -1,
+            )
+        if num_decode_tokens > self.dspark_swa_indices_buffer.shape[0]:
+            raise ValueError(
+                "DSpark sparse-index buffer capacity is smaller than the draft graph: "
+                f"num_decode_tokens={num_decode_tokens}, "
+                f"capacity={self.dspark_swa_indices_buffer.shape[0]}"
+            )
+        if computed_indices.shape[1:] != self.dspark_swa_indices_buffer.shape[1:]:
+            raise ValueError(
+                "DSpark sparse-index width changed after graph buffer allocation: "
+                f"computed={tuple(computed_indices.shape[1:])}, "
+                f"buffer={tuple(self.dspark_swa_indices_buffer.shape[1:])}"
+            )
+        stored_indices = self.dspark_swa_indices_buffer[:num_decode_tokens]
+        stored_indices.copy_(computed_indices[:num_decode_tokens])
+        return stored_indices
 
     def build_prefill_metadata_for_drafting(
         self,
@@ -1421,7 +1452,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         block_table = common_attn_metadata.block_table_tensor
         if not common_attn_metadata.causal:
             assert num_decodes is not None
-            dspark_swa_indices, _ = build_dspark_swa_indices(
+            computed_dspark_swa_indices, _ = build_dspark_swa_indices(
                 block_table[:num_decodes],
                 self.speculative_config.num_speculative_tokens,
                 self.model_config.hf_config.sliding_window,
@@ -1430,7 +1461,10 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 seq_lens[:num_decodes],
                 num_decode_tokens,
             )
-            dspark_swa_indices = dspark_swa_indices[:num_decode_tokens_typed]
+            dspark_swa_indices = self._store_dspark_swa_indices(
+                computed_dspark_swa_indices,
+                num_decode_tokens_typed,
+            )
             ori_win_left, ori_win_right = get_dspark_sparse_sas_window(self.vllm_config)
 
         metadata_op = DeviceOperator.get_dsa_sparse_attn_metadata_op()

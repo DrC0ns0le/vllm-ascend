@@ -230,6 +230,23 @@ PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
 SEQ_LEN_WITH_MAX_PA_WORKSPACE = 6144
 
 
+def _get_draft_capture_sizes(
+    drafter: Any,
+    capture_descs: list[tuple[CUDAGraphMode, list[BatchDescriptor]]],
+) -> list[int]:
+    """Derive draft graph parameter sizes from target graph descriptors."""
+    get_draft_graph_num_tokens = getattr(
+        drafter,
+        "get_graph_num_input_tokens",
+        lambda desc: desc.num_tokens,
+    )
+    return sorted({
+        get_draft_graph_num_tokens(desc)
+        for _, descs in capture_descs
+        for desc in descs
+    })
+
+
 @dataclass
 class GraphCaptureContext:
     stream: torch.npu.Stream
@@ -2214,6 +2231,11 @@ class NPUModelRunner(GPUModelRunner):
             deferred_state_corrections_fn()
         return None
 
+    def _finalize_kv_connector_after_draft(self) -> None:
+        """Finalize deferred KV Pool work after speculative drafting."""
+        if self.speculative_config is not None:
+            self.finalize_kv_connector()
+
     @torch.inference_mode()
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
@@ -2346,8 +2368,7 @@ class NPUModelRunner(GPUModelRunner):
             # vLLM v0.18 defers KV connector finalization during target-model
             # forward when speculative decoding is enabled. Finalize here after
             # draft model runs so KV pool save/put can complete.
-            if self.speculative_config is not None:
-                self.finalize_kv_connector()
+            self._finalize_kv_connector_after_draft()
 
             draft_token_ids = self._draft_token_ids if use_pp_spec_decode else None
             if draft_token_ids is not None:
@@ -5002,7 +5023,13 @@ class NPUModelRunner(GPUModelRunner):
         if self.use_aclgraph:
             set_graph_params(capture_sizes)
             if self.speculative_config:
-                set_draft_graph_params(capture_sizes)
+                draft_capture_sizes = capture_sizes
+                if self.drafter is not None:
+                    draft_capture_sizes = _get_draft_capture_sizes(
+                        self.drafter,
+                        capture_descs,
+                    )
+                set_draft_graph_params(draft_capture_sizes)
 
     def capture_model(self) -> int:
         """Capture NPU graphs and return actual graph pool memory bytes consumed."""

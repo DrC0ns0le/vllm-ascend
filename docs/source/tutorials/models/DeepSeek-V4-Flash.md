@@ -197,7 +197,17 @@ Single-node deployment completes both Prefill and Decode within the same node. T
     export TASK_QUEUE_ENABLE=1
     export HCCL_OP_EXPANSION_MODE=AIV
 
-    vllm serve /root/.cache/modelscope/hub/models/UploadWeight/DeepSeek-V4-Flash-DSpark-w4a8-test \
+    KV_TRANSFER_CONFIG='{
+      "kv_connector": "AscendStoreConnector",
+      "kv_role": "kv_both",
+      "kv_connector_extra_config": {
+        "backend": "mooncake",
+        "lookup_rpc_port": "0",
+        "use_layerwise": false
+      }
+    }'
+
+    vllm serve /path/to/DeepSeek-V4-Flash-0731-w8a8 \
         --max-model-len 800000 \
         --max-num-batched-tokens 8192 \
         --served-model-name dsv4-dspark \
@@ -211,14 +221,26 @@ Single-node deployment completes both Prefill and Decode within the same node. T
         --enable-auto-tool-choice \
         --reasoning-parser deepseek_v4 \
         --no-disable-hybrid-kv-cache-manager \
+        --kv-transfer-config "$KV_TRANSFER_CONFIG" \
         --model-loader-extra-config='{"enable_multithread_load": true, "num_threads": 128}' \
         --quantization ascend \
         --port 8000 \
         --block-size 128 \
-        --speculative-config '{"method": "dspark", "num_speculative_tokens": 7, "enforce_eager": true}'  \
+        --speculative-config '{"method":"dspark","num_speculative_tokens":7}' \
         --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}'
     ```
-    tps more than 50+ ,its reach  2X speed of dsv4f with mtp
+
+    `FULL_DECODE_ONLY` captures the fixed-width DSV4 DSpark backbone and
+    sequential greedy Markov sampling at seven draft tokens per request. The
+    variable context-KV preparation and all `AscendStoreConnector` lookup,
+    load, save, and finalization work remain eager. This example is combined
+    serving (`kv_both`) with non-layerwise Mooncake KV Pool; submit the same
+    prompt twice to verify a miss/store followed by a real hit/load while graph
+    replay remains active.
+
+    The W4A8 TP4 acceptance configuration uses the same graph and speculative
+    options with `--tensor-parallel-size 4`, and validates both
+    `num_speculative_tokens=5` and `num_speculative_tokens=7`.
 
 === "A3 series"
 

@@ -1,3 +1,4 @@
+import inspect
 import unittest
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -6,6 +7,7 @@ from unittest.mock import MagicMock, call, patch
 import numpy as np
 import torch
 from vllm.config import CUDAGraphMode
+from vllm.forward_context import BatchDescriptor
 from vllm.model_executor.layers.attention import MLAAttention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
@@ -20,7 +22,7 @@ from vllm.v1.kv_cache_interface import (
 from vllm_ascend.attention.utils import get_sfa_qsfa_packed_head_dim
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, AscendSFAIndexerCacheSpec
 from vllm_ascend.utils import AscendDeviceType
-from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
+from vllm_ascend.worker.model_runner_v1 import NPUModelRunner, _get_draft_capture_sizes
 
 
 class TestDummyRunSlotInvalidation(unittest.TestCase):
@@ -159,6 +161,35 @@ class TestDSparkAuxCaptureMode(unittest.TestCase):
         )
 
         self.assertFalse(runner._draft_uses_qwen3_gqa_dspark())
+
+    def test_draft_graph_params_use_native_dspark_width(self):
+        drafter = SimpleNamespace(
+            get_graph_num_input_tokens=lambda desc: desc.num_reqs * 7,
+        )
+        capture_descs = [
+            (
+                CUDAGraphMode.FULL,
+                [
+                    BatchDescriptor(num_tokens=8, num_reqs=1, uniform=True),
+                    BatchDescriptor(num_tokens=32, num_reqs=4, uniform=True),
+                ],
+            )
+        ]
+
+        self.assertEqual(_get_draft_capture_sizes(drafter, capture_descs), [7, 28])
+
+    def test_kv_connector_finalization_remains_after_drafting(self):
+        source = inspect.getsource(NPUModelRunner.sample_tokens)
+        draft_call = source.index("propose_draft_token_ids(sampler_output.sampled_token_ids)")
+        finalize_call = source.index("self._finalize_kv_connector_after_draft()")
+
+        self.assertLess(draft_call, finalize_call)
+
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner.speculative_config = SimpleNamespace(method="dspark")
+        runner.finalize_kv_connector = MagicMock()
+        runner._finalize_kv_connector_after_draft()
+        runner.finalize_kv_connector.assert_called_once_with()
 
 
 class TestNPUModelRunnerKVCache(unittest.TestCase):
