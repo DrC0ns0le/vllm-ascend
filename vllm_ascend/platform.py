@@ -54,13 +54,9 @@ from vllm_ascend.utils import (
     enable_sp,
 )
 
-# Since vllm-project/vllm#43746, DeepSeek V4 model classes no longer
-# carry @support_torch_compile. This makes vLLM auto-enable the breakable
-# cudagraph PIECEWISE path, which is not supported on Ascend yet.
-envs_vllm.VLLM_USE_BREAKABLE_CUDAGRAPH = False
-logger.info(
-    "Breakable cudagraph is force disabled on Ascend because DeepSeek V4 PIECEWISE cudagraph is not supported yet."
-)
+# Keep the upstream switch opt-in. It must be set before importing model
+# modules: eager_break_during_capture decides whether to wrap at import time.
+os.environ.setdefault("VLLM_USE_BREAKABLE_CUDAGRAPH", "0")
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig, VllmConfig
@@ -554,7 +550,7 @@ class NPUPlatform(Platform):
             vllm_config.additional_config["ascend_compilation_config"]["enable_static_kernel"] = False
         elif compilation_config.cudagraph_mode.requires_piecewise_compilation():
             # Our is_cuda_alike is False so we cannot reuse the assertion of upstream
-            assert compilation_config.mode == CompilationMode.VLLM_COMPILE, (
+            assert compilation_config.mode == CompilationMode.VLLM_COMPILE or envs_vllm.VLLM_USE_BREAKABLE_CUDAGRAPH, (
                 "Compilation mode should be CompilationMode.VLLM_COMPILE "
                 "when cudagraph_mode piecewise cudagraphs is used, "
                 "cudagraph_mode=%s",

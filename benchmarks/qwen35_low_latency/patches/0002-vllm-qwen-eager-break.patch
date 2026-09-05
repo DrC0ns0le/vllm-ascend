@@ -1,0 +1,19 @@
+--- a/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
++++ b/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+@@ -8,6 +8,7 @@
+ from einops import rearrange
+ from torch import nn
+
++from vllm.compilation.breakable_cudagraph import eager_break_during_capture
+ from vllm import envs
+ from vllm._aiter_ops import rocm_aiter_ops
+ from vllm.config import (
+@@ -1670,7 +1671,7 @@
+
+ direct_register_custom_op(
+     op_name="qwen_gdn_attention_core",
+-    op_func=qwen_gdn_attention_core,
++    op_func=eager_break_during_capture(qwen_gdn_attention_core),
+     mutates_args=["a_or_z_out", "core_attn_out"],
+     fake_impl=gdn_attention_core_fake,
+ )

@@ -28,6 +28,10 @@ from typing import Any
 # begin-env-vars-definition
 
 env_variables: dict[str, Callable[[], Any]] = {
+    # Experimental fresh-prefill PTO MegaGDN on Ascend 910B. Non-sensitive.
+    # Valid values: 0 (default, current GDN), 1 (opt-in). TP/PP/PCP/DCP=1,
+    # mamba_cache_mode=none and supported shapes are required for the fast path.
+    "VLLM_ASCEND_PTO_CHUNK_GDN": lambda: bool(int(os.getenv("VLLM_ASCEND_PTO_CHUNK_GDN", "0"))),
     # max compile thread number for package building. Usually, it is set to
     # the number of CPU cores. If not set, the default value is None, which
     # means all number of CPU cores will be used.

@@ -33,6 +33,7 @@ from vllm.v1.attention.backends.utils import (
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
 
+from vllm_ascend import envs
 from vllm_ascend.ops.triton.fla.utils import (
     prepare_chunk_indices,
     prepare_chunk_offsets,
@@ -91,6 +92,8 @@ class GDNChunkedPrefillMetadata:
     num_decodes: int
     cu_seqlens_kern: tuple[int, ...] | None = None
     keep_meta: torch.Tensor | None = None
+    # Proven from CPU sequence lengths; unknown/stateful batches fall back.
+    fresh_prefill: bool = False
 
 
 @dataclass
@@ -747,6 +750,17 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                 prefill_query_start_loc_cpu,
                 query_start_loc.device,
             )
+            if envs.VLLM_ASCEND_PTO_CHUNK_GDN and spec_sequence_masks is None:
+                seq_lens_cpu = m.seq_lens_cpu_upper_bound
+                if seq_lens_cpu is not None and seq_lens_cpu.device.type == "cpu":
+                    # An upper bound equal to the scheduled query length proves
+                    # zero prior context. A stale larger bound only falls back.
+                    prefill_slice = slice(num_decodes, num_decodes + num_prefills)
+                    query_lens_cpu = torch.diff(query_start_loc_cpu)[prefill_slice]
+                    contexts_cpu = seq_lens_cpu[prefill_slice] - query_lens_cpu
+                    non_spec_chunked_prefill_metadata.fresh_prefill = bool(
+                        contexts_cpu.numel() == num_prefills and torch.all(contexts_cpu == 0).item()
+                    )
             # Preserve upstream GDNAttentionMetadata fields for callers that
             # still use the chunk_gated_delta_rule API directly.
             chunk_indices = non_spec_chunked_prefill_metadata.chunk_indices_chunk64
