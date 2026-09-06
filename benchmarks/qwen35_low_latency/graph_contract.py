@@ -25,7 +25,7 @@ def main():
     from vllm_ascend.worker.model_runner_v1 import _torch_cuda_wrapper
 
     torch.npu.set_device(0)
-    context = SimpleNamespace(cudagraph_runtime_mode=CUDAGraphMode.PIECEWISE, lengths=(192,))
+    context = SimpleNamespace(cudagraph_runtime_mode=CUDAGraphMode.PIECEWISE, lengths=(256,))
 
     class Core:
         def __init__(self):
@@ -41,9 +41,9 @@ def main():
 
     core = Core()
     context.no_compile_layers = {"test_gdn": core}
-    x = torch.ones(192, 1, 128, device="npu", dtype=torch.bfloat16)
+    x = torch.ones(256, 1, 128, device="npu", dtype=torch.bfloat16)
     output = torch.zeros_like(x)
-    gates = torch.zeros(192, 1, device="npu", dtype=torch.bfloat16)
+    gates = torch.zeros(256, 1, device="npu", dtype=torch.bfloat16)
     stream = torch.npu.Stream()
     stream.wait_stream(torch.npu.current_stream())
     with (
@@ -60,7 +60,22 @@ def main():
             result = output + 3
         assert capture.num_eager_breaks == 1, "Qwen registration did not activate its eager break"
         assert capture.num_graphs == 2
-        for lengths in ((192,), (96, 96), (64, 64, 64), (48, 48, 48, 48), (90, 90), (133,), (1,)):
+        for lengths in (
+            (256,),
+            (128, 128),
+            (64,) * 4,
+            (32,) * 8,
+            (16,) * 16,
+            (8,) * 32,
+            (4,) * 64,
+            (64, 192),
+            (100, 156),
+            (80, 80, 96),
+            (192,),
+            (90, 90),
+            (133,),
+            (1,),
+        ):
             context.lengths = lengths
             previous = core.calls
             capture.replay()
@@ -74,7 +89,7 @@ def main():
             torch.testing.assert_close(result, expected, rtol=0, atol=0)
 
         context.cudagraph_runtime_mode = CUDAGraphMode.FULL
-        context.lengths = (192,)
+        context.lengths = (256,)
         full = breakable_cudagraph.BreakableCUDAGraphCapture()
         with full:
             torch.ops.vllm.qwen_gdn_attention_core(x, gates, gates, output, "test_gdn", False)
@@ -83,7 +98,7 @@ def main():
         full.replay()
         stream.synchronize()
         assert core.calls == previous
-    print("PASS: registered Qwen op re-enters metadata across 1/2/3/4-request PIECEWISE reuse; FULL has no eager break")
+    print("PASS: registered Qwen op re-enters metadata across 1–64-request PIECEWISE reuse; FULL has no eager break")
 
 
 if __name__ == "__main__":

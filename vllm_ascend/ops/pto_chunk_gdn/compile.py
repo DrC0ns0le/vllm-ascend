@@ -3,6 +3,7 @@
 
 import hashlib
 import logging
+import shlex
 import subprocess
 import tempfile
 from pathlib import Path
@@ -77,12 +78,15 @@ def compile_mega_kernel(*, num_heads: int, key_heads: int, hidden_size: int = 12
     cache.mkdir(parents=True, exist_ok=True)
     output = cache / f"mega_H{num_heads}_Hg{key_heads}_D{hidden_size}_C{chunk_size}_{digest.hexdigest()[:20]}.so"
     with FileLock(str(output) + ".lock"):
-        if not output.exists():
+        cache_hit = output.exists()
+        if not cache_hit:
             started = perf_counter()
             with tempfile.TemporaryDirectory(dir=cache) as temporary:
                 built = Path(temporary) / "kernel.so"
+                command = [str(compiler), *flags, str(KERNELS_PTO / "mega_kernel.cpp"), "-o", str(built)]
+                logger.info("MegaGDN compile command: %s", shlex.join(command))
                 subprocess.run(
-                    [str(compiler), *flags, str(KERNELS_PTO / "mega_kernel.cpp"), "-o", str(built)],
+                    command,
                     check=True,
                     timeout=600,
                 )
@@ -95,6 +99,12 @@ def compile_mega_kernel(*, num_heads: int, key_heads: int, hidden_size: int = 12
                 chunk_size,
                 perf_counter() - started,
             )
+        logger.info(
+            "MegaGDN binary: path=%s sha256=%s cache_hit=%s",
+            output,
+            hashlib.sha256(output.read_bytes()).hexdigest(),
+            cache_hit,
+        )
     return output
 
 

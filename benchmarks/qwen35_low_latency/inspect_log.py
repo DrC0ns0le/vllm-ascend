@@ -24,7 +24,23 @@ def inspect(text):
     totals = collections.Counter()
     for values in counters.values():
         totals.update(values)
+    routes = re.findall(r"Breakable ACLGraph route:.*", text)
+    route_counts = collections.Counter()
+    for line in routes:
+        mode = re.search(r"mode=(\S+)", line)
+        bucket = re.search(r"num_tokens=(\d+)", line)
+        actual = re.search(r"actual_tokens=(\d+) num_reqs=(\d+)", line)
+        if mode and bucket and actual:
+            route_counts[(mode[1], int(bucket[1]), int(actual[1]), int(actual[2]))] += 1
+    fallback_calls = sum(count for name, count in totals.items() if name.startswith("fallback:"))
+    prefill_calls = totals["megagdn"] + fallback_calls
     return dict(
+        routes=[
+            dict(mode=mode, bucket=bucket, actual_tokens=actual, num_reqs=reqs, calls=count)
+            for (mode, bucket, actual, reqs), count in sorted(route_counts.items())
+        ],
+        mega_selection_fraction=totals["megagdn"] / prefill_calls if prefill_calls else None,
+        mega_selection_denominator="Observed layer prefill calls, including ineligible fallbacks; not unique requests",
         captures=captures,
         logical_replay_calls=len(replays),
         graph_segment_submissions=sum(int(re.search(r"graphs=(\d+)", line)[1]) for line in replays),

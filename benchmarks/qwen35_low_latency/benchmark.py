@@ -8,6 +8,7 @@ import math
 import random
 import threading
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -67,6 +68,12 @@ CONCURRENT = (
     (192,),
     (96, 96),
     (64, 64, 64),
+    (256,),
+    (128, 128),
+    (64, 64, 64, 64),
+    (64, 192),
+    (100, 156),
+    (80, 80, 96),
 )
 PRIMARY = ((64, 1), (68, 4), (128, 1), (128, 4), (128, 8), (133, 4), (192, 1), (256, 1), (512, 1))
 
@@ -136,6 +143,8 @@ def request_one(base_url, model, prompt, output, release=None, wait=None, fixed_
     if usage["prompt_tokens"] != len(prompt):
         raise RuntimeError(f"Prompt token length changed: {len(prompt)} -> {usage['prompt_tokens']}")
     return dict(
+        status="ok",
+        http_status=200,
         prompt_tokens=len(prompt),
         output_tokens=actual_output,
         output_budget=output,
@@ -150,12 +159,134 @@ def request_one(base_url, model, prompt, output, release=None, wait=None, fixed_
     )
 
 
+def request_record(base_url, model, prompt, output, *args, **kwargs):
+    """Retain failed attempts so a bad c64 run cannot look like a smaller pass."""
+    started = time.perf_counter()
+    try:
+        return request_one(base_url, model, prompt, output, *args, **kwargs)
+    except Exception as error:
+        ended = time.perf_counter()
+        release = kwargs.get("release", args[0] if args else None)
+        if release is not None:
+            # Let dependent test clients finish after a failure; the run is
+            # still marked failed and cannot establish mixed-batch correctness.
+            release.set()
+        return dict(
+            status="error",
+            http_status=getattr(error, "code", None),
+            error=str(error),
+            prompt=prompt,
+            prompt_tokens=len(prompt),
+            output_budget=output,
+            output_tokens=None,
+            text="",
+            tokens=[],
+            started=started,
+            ended=ended,
+            ttft_ms=None,
+            tpot_ms=None,
+            e2e_ms=(ended - started) * 1000,
+        )
+
+
 def summary(rows, elapsed):
-    result = {"requests": len(rows), "requests_per_second": len(rows) / elapsed}
+    successful = [row for row in rows if row.get("status", "ok") == "ok"]
+    result = dict(
+        requests=len(rows),
+        successful_requests=len(successful),
+        errors=len(rows) - len(successful),
+        error_rate=(len(rows) - len(successful)) / len(rows) if rows else None,
+        requests_per_second=len(successful) / elapsed if elapsed > 0 else None,
+    )
     for name, percentiles in (("ttft_ms", (50, 95, 99)), ("e2e_ms", (50, 95, 99)), ("tpot_ms", (50, 95))):
         for p in percentiles:
-            result[f"{name}_p{p}"] = percentile([row[name] for row in rows if row[name] is not None], p)
+            result[f"{name}_p{p}"] = percentile([row[name] for row in successful if row[name] is not None], p)
     return result
+
+
+def production_workload(distribution, count, seed, live=False):
+    rng = random.Random(seed)
+    ragged = (64, 1024, 65, 900, 128, 700, 192, 600)
+    result = []
+    for index in range(count):
+        if distribution == "ragged":
+            length = ragged[index % len(ragged)]
+        else:
+            length = rng.randint(64, 256 if distribution == "short-heavy" else 1024)
+        result.append((length, rng.randint(3, 10) if live else 4))
+    return result
+
+
+def controlled_prompt(seed_tokens, length, index):
+    if not seed_tokens:
+        raise ValueError("Tokenizer returned an empty seed")
+    # Rotating a real tokenized seed makes equal-length requests differ while
+    # retaining exact token counts. Server usage must independently confirm it.
+    offset = index % len(seed_tokens)
+    seed = seed_tokens[offset:] + seed_tokens[:offset]
+    return (seed * math.ceil(length / len(seed)))[:length]
+
+
+def continuous_requests(cases, concurrency, request, record):
+    """Bound client HTTP concurrency and replace completions immediately.
+
+    These remain individual API requests. vLLM alone packs model-step batches.
+    """
+    if concurrency <= 0:
+        raise ValueError("concurrency must be positive")
+    iterator = iter(enumerate(cases))
+    rows = []
+    peak = 0
+    active = 0
+    lock = threading.Lock()
+
+    def run(index, case):
+        nonlocal active, peak
+        with lock:
+            active += 1
+            peak = max(peak, active)
+        try:
+            return request(index, case)
+        finally:
+            with lock:
+                active -= 1
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
+        pending = {}
+
+        def submit():
+            entry = next(iterator, None)
+            if entry is not None:
+                index, case = entry
+                pending[pool.submit(run, index, case)] = index
+
+        for _ in range(concurrency):
+            submit()
+        while pending:
+            done, _ = concurrent.futures.wait(pending, return_when=concurrent.futures.FIRST_COMPLETED)
+            for future in done:
+                index = pending.pop(future)
+                row = future.result() | dict(request_id=index)
+                record(row)
+                rows.append(row)
+                submit()
+    return rows, peak
+
+
+def collect_metrics(base_url, output, stop):
+    # Preserve the runtime's actual metric names/labels. Missing metrics are
+    # explicit errors, not invented zeros for cache, memory or preemption.
+    with output.open("w") as file:
+        while not stop.is_set():
+            sample = dict(timestamp=time.time())
+            try:
+                with urllib.request.urlopen(base_url + "/metrics", timeout=2) as response:
+                    sample["prometheus"] = response.read().decode()
+            except Exception as error:
+                sample["error"] = str(error)
+            file.write(json.dumps(sample) + "\n")
+            file.flush()
+            stop.wait(1)
 
 
 def main():
@@ -164,16 +295,23 @@ def main():
     parser.add_argument("--model", default="qwen")
     parser.add_argument("--variant", choices=list("ABCD"), required=True)
     parser.add_argument(
-        "--suite", choices=["primary", "boundaries", "concurrent", "mixed", "stress", "corpus"], default="primary"
+        "--suite",
+        choices=["primary", "boundaries", "concurrent", "mixed", "stress", "corpus", "production", "live"],
+        default="primary",
     )
     parser.add_argument("--repetitions", type=int, default=100)
-    parser.add_argument("--concurrency", type=int, choices=[1, 2, 4], default=1)
+    parser.add_argument("--concurrency", type=int, choices=[1, 2, 4, 8, 16, 32, 64], default=1)
+    parser.add_argument("--requests", type=int, help="Total production/live requests; defaults to 512/1000")
+    parser.add_argument("--distribution", choices=["short-heavy", "wide", "ragged"], default="wide")
+    parser.add_argument("--seed", type=int, default=1024)
     parser.add_argument("--max-model-len", type=int, default=1536)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--corpus", type=Path, help='JSONL: {"prompt": "..." or token IDs, "max_tokens": 8}')
     args = parser.parse_args()
     if args.suite == "corpus" and args.corpus is None:
         parser.error("--suite corpus requires --corpus")
+    if args.repetitions <= 0 or (args.requests is not None and args.requests <= 0):
+        parser.error("request and repetition counts must be positive")
     args.output.mkdir(parents=True, exist_ok=False)
     with urllib.request.urlopen(args.base_url + "/v1/models") as response:
         json.load(response)
@@ -192,11 +330,52 @@ def main():
 
     def prompt(length, index):
         seed = seeds[index % len(seeds)]
-        return (seed * math.ceil(length / len(seed)))[:length]
+        return controlled_prompt(seed, length, index // len(seeds))
 
     # Warm all relevant paths before timing; compilation time stays in startup logs.
     for index in range(4):
         request_one(args.base_url, args.model, prompt(128, index), 8)
+    if args.suite in ("production", "live"):
+        count = args.requests or (1000 if args.suite == "live" else 512)
+        cases = production_workload(args.distribution, count, args.seed, args.suite == "live")
+        if any(p + o > args.max_model_len for p, o in cases):
+            parser.error("Production workload exceeds max-model-len")
+        stop = threading.Event()
+        sampler = threading.Thread(target=collect_metrics, args=(args.base_url, args.output / "metrics.jsonl", stop))
+        sampler.start()
+        try:
+            with (args.output / "requests.jsonl").open("w") as raw:
+
+                def record(row):
+                    raw.write(json.dumps(row) + "\n")
+                    raw.flush()
+
+                started = time.perf_counter()
+                rows, peak = continuous_requests(
+                    cases,
+                    args.concurrency,
+                    lambda index, case: request_record(args.base_url, args.model, prompt(case[0], index), case[1])
+                    | dict(variant=args.variant, concurrency=args.concurrency),
+                    record,
+                )
+                report = summary(rows, time.perf_counter() - started) | dict(
+                    variant=args.variant,
+                    suite=args.suite,
+                    distribution=args.distribution,
+                    seed=args.seed,
+                    concurrency=args.concurrency,
+                    max_client_in_flight=peak,
+                    mixed_scheduler_evidence="required",
+                    server_capacity_evidence="metrics.jsonl and runtime logs",
+                )
+                (args.output / "summary.json").write_text(json.dumps(report, indent=2) + "\n")
+                print(json.dumps(report), flush=True)
+        finally:
+            stop.set()
+            sampler.join()
+        if report["errors"]:
+            raise SystemExit("Traffic run had errors; inspect requests.jsonl")
+        return
     corpus_batches = []
     if args.suite == "corpus":
         cases = []
@@ -243,7 +422,7 @@ def main():
                     releases = [threading.Event() for _ in lengths]
                     futures = [
                         pool.submit(
-                            request_one,
+                            request_record,
                             args.base_url,
                             args.model,
                             corpus_batches[group_index][i][0] if corpus_batches else prompt(p, i + repeat),
@@ -270,6 +449,8 @@ def main():
             summaries.append(report)
             print(json.dumps(report), flush=True)
     (args.output / "summary.json").write_text(json.dumps(summaries, indent=2) + "\n")
+    if any(report.get("errors", 0) for report in summaries):
+        raise SystemExit("Traffic run had errors; inspect requests.jsonl")
 
 
 if __name__ == "__main__":

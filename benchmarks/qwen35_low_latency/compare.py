@@ -14,6 +14,8 @@ def read(path):
     groups = collections.defaultdict(list)
     for line in path.read_text().splitlines():
         row = json.loads(line)
+        if row.get("status", "ok") != "ok":
+            raise ValueError("Output comparison requires successful requests; inspect the traffic error report first")
         groups[(tuple(row["prompt"]), row.get("output_budget", row["output_tokens"]))].append(row)
     return groups
 

@@ -67,3 +67,19 @@ def test_missing_headers_fail_before_invoking_compiler(build_tree):
     with pytest.raises(RuntimeError, match="PTO headers missing"):
         compiler.compile_mega_kernel(num_heads=16, key_heads=8)
     assert calls == []
+
+
+def test_transpose_source_change_selects_new_binary_without_deleting_old_cache(build_tree):
+    source, _, calls = build_tree
+    real_source = Path(__file__).resolve().parents[4] / "csrc/pto_chunk_gdn/mega_kernel.cpp"
+    fixed = real_source.read_text()
+    dependency = "        set_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);\n        wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);\n"
+    assert dependency in fixed
+    (source / "mega_kernel.cpp").write_text(fixed.replace(dependency, "", 1))
+    old = compiler.compile_mega_kernel(num_heads=16, key_heads=8)
+    (source / "mega_kernel.cpp").write_text(fixed)
+    new = compiler.compile_mega_kernel(num_heads=16, key_heads=8)
+    assert new != old
+    assert old.is_file() and new.is_file()
+    assert compiler.compile_mega_kernel(num_heads=16, key_heads=8) == new
+    assert len(calls) == 2

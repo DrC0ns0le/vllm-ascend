@@ -2,7 +2,9 @@
 
 This is an **offline implementation, pending NPU validation**. Both paths are implemented. No 910B runtime, model weights, production corpus, CANN compiler, or remote working tree was accessible during development. CPU contracts and source inspection do not establish numerical correctness, graph replay correctness, latency improvement, or production readiness.
 
-The target remains BF16, TP/DP=1, MRV1, four concurrent requests, prefix caching off, Mamba cache mode `none`, and chunked prefill off. `TASK_QUEUE_ENABLE=1` stays enabled. No MRV2, speculative decoding, MTP, quantization, or FULL prefill implementation is included.
+The c64 code update and separate validation steps are described in [C64.md](C64.md). The user reports the original graph path working on NPU; the new c64/kernel changes have not been executed on NPU in this task.
+
+The target remains BF16, TP/DP=1, MRV1, up to 64 concurrently active requests, prefix caching off, Mamba cache mode `none`, and chunked prefill off. `TASK_QUEUE_ENABLE=1` stays enabled. No MRV2, speculative decoding, MTP, quantization, or FULL prefill implementation is included.
 
 ## Source and implementation
 
@@ -10,9 +12,11 @@ The Ascend base is `4095369c34722c24c694d2461f4075f9bed3cbc0`, branch `perf/dsv4
 
 References read:
 
+- [MegaGDN transpose fix 1ed3a073](https://github.com/huawei-csl/megagdn-pto/commit/1ed3a073cb8d6456c8ccda89b7e72ef82da2c2c2): the exact source-UB WAR dependency was backported separately. No other kernel synchronization changes were made.
+
 - [Ascend #12744](https://github.com/vllm-project/vllm-ascend/pull/12744): MRV1 wrapper, workspace ownership, NPU replay ordering and CUDA compatibility mappings. Unrelated models, drafter wrapping and MRV2 changes were excluded.
 - [vLLM #54361](https://github.com/vllm-project/vllm/pull/54361): wrap the Qwen custom-op registrations with `eager_break_during_capture`. The exact reference commit has only the standard registration. The local-copy helper supports both standard and packed registrations when present.
-- [Ascend #8872](https://github.com/vllm-project/vllm-ascend/pull/8872): experimental PTO device kernels and launcher layouts. Device code is retained; integration is scoped to Ascend GDN prefills, without its global worker monkeypatch.
+- [Ascend #8872](https://github.com/vllm-project/vllm-ascend/pull/8872): experimental PTO device kernels and launcher layouts. Device code is retained apart from the confirmed transpose fix; integration is scoped to Ascend GDN prefills, without its global worker monkeypatch.
 - [Ascend #11161](https://github.com/vllm-project/vllm-ascend/pull/11161): reviewed as background. This checkout already passes causal-convolution metadata as device tensors; no additional causal-convolution backport was made.
 
 `BreakableACLGraphWrapper` supports FULL decode and PIECEWISE prefill/mixed dispatch without the legacy compilation route. The existing GDN `UNIFORM_BATCH` capability remains unchanged. Fresh one-token prompts are excluded from uniform FULL decode dispatch when breakable graphs are enabled. Successful FULL capture retains the flag needed by MRV1's subsequent attention-update decision; capture failure restores it.
@@ -79,13 +83,15 @@ Run one server at a time. Stop only the server started for this experiment befor
 | C | FULL_DECODE_ONLY | MegaGDN when eligible | 0 | 1 |
 | D | FULL_AND_PIECEWISE | MegaGDN when eligible | 1 | 1 |
 
-All variants explicitly set BF16, TP/DP=1, max-num-seqs=4, max-model-len=1536, no prefix caching, no chunked prefill, `mamba_cache_mode=none`, MRV1 and task queue 1. The breakable environment is set **before process import**. B/D explicitly use compilation mode 0 to avoid legacy FX segmentation.
+All variants explicitly set BF16, TP/DP=1, max-num-seqs=64, max-model-len=1536, max-num-batched-tokens=2048, no prefix caching, no chunked prefill, `mamba_cache_mode=none`, MRV1 and task queue 1. The breakable environment is set **before process import**. B/D explicitly use compilation mode 0 to avoid legacy FX segmentation.
 
-Profile 1536 uses capture sizes `1,2,3,4,64,128,192,256,384,512,768,1024,1536`. `--profile 4096` sets the scheduling budget to 4096 and adds `2048,3072,4096`. A/C capture only FULL decode sizes 1–4. The vLLM dispatcher may capture both FULL and PIECEWISE entries for the small sizes; count actual descriptors rather than assuming the list length is the entry count.
+The default decode ladder is `1,2,3,4,8,16,32,64`. B/D add prefill/mixed buckets `128,192,256,384,512,768,1024,1536,2048`. A/C capture only the decode ladder. Use `--max-num-seqs` and `--max-num-batched-tokens` for overrides. Legacy `--profile 1536` and `--profile 4096` remain token-budget aliases. An explicit non-ladder request limit adds only that terminal decode size so the dispatcher retains coverage up to the chosen ceiling. The vLLM dispatcher may capture both FULL and PIECEWISE entries for the small sizes; count actual descriptors rather than assuming the list length is the entry count.
 
-Inspect the effective startup configuration and `Breakable ACLGraph config` log. Confirm BF16, cache mode `none`, prefix caching false, chunked prefill false, and four request slots. If the branch warns that disabling chunked prefill is unsupported, test its actual scheduler behavior before accepting this launch profile. The metadata-based MegaGDN fallback remains safe for continuing chunks, but this does not establish scheduler correctness.
+Inspect the effective startup configuration and `Breakable ACLGraph config` log. Confirm BF16, cache mode `none`, prefix caching false, chunked prefill false, and the requested number of request slots. If the branch warns that disabling chunked prefill is unsupported, test its actual scheduler behavior before accepting this launch profile. The metadata-based MegaGDN fallback remains safe for continuing chunks, but this does not establish scheduler correctness.
 
 ## Validation commands
+
+The launcher pins 15 GiB of KV-cache memory by default, based on the user’s approximate previous setting. Override `--kv-cache-memory-bytes` with any suitable positive capacity, or explicitly select automatic sizing with `--gpu-memory-utilization`. Cache, recurrent states, graph capture and transient PTO workspaces must all fit. This default is not a measured c64 capacity guarantee.
 
 Offline contracts (requires pytest, CPU Torch 2.10, NumPy, regex, filelock, a C++ compiler and Ninja; the helper bypasses runtime package initializers):
 
@@ -100,7 +106,7 @@ VLLM_USE_V2_MODEL_RUNNER=0 VLLM_USE_BREAKABLE_CUDAGRAPH=1 TASK_QUEUE_ENABLE=1 \
   python benchmarks/qwen35_low_latency/graph_contract.py
 ```
 
-This invokes the actual registered standard Qwen custom op with a synthetic core. It checks mutable context re-entry across `1×192`, `2×96`, `3×64`, `4×48`, `2×90`, P133 and P1 sharing a 192-token capture. It also checks that FULL capture ignores eager breaks. It does not validate real GDN math or full-attention metadata.
+This invokes the actual registered standard Qwen custom op with a synthetic core. It checks mutable context re-entry across `1×256`, `2×128`, `4×64`, through `64×4`, plus ragged 256-token decompositions, `2×90`, P133 and P1 sharing a 256-token capture. It also checks that FULL capture ignores eager breaks. It does not validate real GDN math or full-attention metadata.
 
 Direct numerical gate, without running a server:
 
@@ -109,9 +115,9 @@ TASK_QUEUE_ENABLE=1 python benchmarks/qwen35_low_latency/numerical.py \
   --model /dev/shm/Qwen3_5-2B --output /workspace/megagdn-numerical.json
 ```
 
-The script reads H/Hg/D from the checkpoint config, compares output and final recurrent state at every requested boundary, includes multiple partial final chunks and multi-sequence cases, and repeats three random seeds. It reports finite checks, max and p50/p95/p99 absolute/relative errors. Relative error uses a 1e-3 denominator floor. Default 0.05 absolute/relative tolerances are provisional screening limits; passing them is not a task-quality acceptance decision.
+The script reads H/Hg/D from the checkpoint config, compares output and final recurrent state at every requested boundary, includes multiple partial final chunks and multi-sequence cases, and repeats three random seeds. It includes bounded packed Nseq=1/2/4/8/16/32/64 layouts and reports every sequence independently. Both final states then pass through the normal recurrent decode operator for 1/4/8 steps. It reports finite checks, max, mean and p50/p95/p99 absolute/relative errors. Relative error uses a 1e-3 denominator floor. Default 0.05 absolute/relative tolerances are provisional screening limits; passing them is not a task-quality acceptance decision.
 
-Serving matrix; repeat for each variant, and run the primary suite at concurrency 1, 2 and 4:
+Serving matrix; repeat for each variant. The harness accepts concurrency 1, 2, 4, 8, 16, 32 and 64. See [C64.md](C64.md) for the production and continuous replacement suites:
 
 ```bash
 python benchmarks/qwen35_low_latency/benchmark.py --variant B --suite primary \

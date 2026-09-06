@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 import importlib.util
+import io
 import json
+import sys
+import threading
+import urllib.error
 from pathlib import Path
 
 import pytest
@@ -101,6 +105,8 @@ def test_log_evidence_requires_actual_mixed_metadata_and_latest_layer_counters()
     inspect = load("inspect_log").inspect
     assert not inspect("clients overlap\nQwen GDN step: prefills=1 decodes=0")["mixed_gdn_observed"]
     report = inspect(
+        "Breakable ACLGraph route: mode=FULL descriptor=BatchDescriptor(num_tokens=64, num_reqs=64) "
+        "actual_tokens=33 num_reqs=33 scheduled=[1]\n"
         "Qwen GDN step: prefills=2 decodes=1\n"
         "Breakable ACLGraph replay: graphs=19 eager_breaks=18\n"
         "MegaGDN counters: layer=layer0 counts={'megagdn': 1}\n"
@@ -111,3 +117,76 @@ def test_log_evidence_requires_actual_mixed_metadata_and_latest_layer_counters()
     assert report["graph_segment_submissions"] == 19
     assert report["eager_break_invocations"] == 18
     assert report["mega_counters"] == {"megagdn": 4, "fallback:hardware": 1}
+    assert report["routes"] == [dict(mode="FULL", bucket=64, actual_tokens=33, num_reqs=33, calls=1)]
+    assert report["mega_selection_fraction"] == 0.8
+
+
+@pytest.mark.parametrize("distribution", ["short-heavy", "wide", "ragged"])
+def test_production_workloads_have_deterministic_exact_lengths(distribution):
+    bench = load("benchmark")
+    cases = bench.production_workload(distribution, 1000, 1024, live=True)
+    assert cases == bench.production_workload(distribution, 1000, 1024, live=True)
+    assert len(cases) == 1000
+    assert all(64 <= p <= (256 if distribution == "short-heavy" else 1024) and 3 <= o <= 10 for p, o in cases)
+    assert all(o == 4 for _, o in bench.production_workload(distribution, 512, 1024))
+    first = bench.controlled_prompt([1, 2, 3], 64, 0)
+    second = bench.controlled_prompt([1, 2, 3], 64, 1)
+    assert len(first) == len(second) == 64 and first != second
+
+
+def test_live_traffic_replaces_completed_request_without_waiting_for_wave():
+    bench = load("benchmark")
+    replacement_started = threading.Event()
+
+    def request(index, case):
+        if index == 0:
+            assert replacement_started.wait(2), "Replacement was blocked behind the slow request"
+        if index == 2:
+            replacement_started.set()
+        return dict(status="ok")
+
+    recorded = []
+    rows, peak = bench.continuous_requests([(64, 4)] * 8, 2, request, recorded.append)
+    assert len(rows) == len(recorded) == 8
+    assert peak == 2
+    assert {row["request_id"] for row in rows} == set(range(8))
+
+
+def test_http_failures_are_recorded_and_excluded_from_success_latency(monkeypatch):
+    bench = load("benchmark")
+
+    def fail(*args, **kwargs):
+        raise urllib.error.HTTPError("http://test", 500, "failed", {}, None)
+
+    monkeypatch.setattr(bench, "post", fail)
+    error = bench.request_record("http://test", "qwen", [1, 2], 4)
+    assert error["status"] == "error" and error["http_status"] == 500
+    assert error["output_tokens"] is None
+    report = bench.summary([error, dict(status="ok", ttft_ms=100, e2e_ms=124, tpot_ms=8)], 1)
+    assert report["error_rate"] == 0.5
+    assert report["ttft_ms_p50"] == 100
+    assert report["requests_per_second"] == 1
+
+
+def test_readiness_requires_successful_warmup_inference(monkeypatch):
+    bench = load("benchmark")
+    monkeypatch.setitem(sys.modules, "benchmark", bench)
+    startup = load("warmup")
+    monkeypatch.setattr(
+        startup.urllib.request, "urlopen", lambda *args, **kwargs: io.BytesIO(b'{"data":[{"id":"qwen"}]}')
+    )
+    monkeypatch.setattr(startup, "post", lambda *args, **kwargs: io.BytesIO(b'{"tokens":[1,2,3]}'))
+
+    def infer(base_url, model, prompt, output):
+        assert len(prompt) == 64 and output == 4
+        return dict(status="ok")
+
+    monkeypatch.setattr(startup, "request_one", infer)
+    assert startup.warmup("http://test", "qwen", 1)["ready"]
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("warmup inference failed")
+
+    monkeypatch.setattr(startup, "request_one", fail)
+    with pytest.raises(RuntimeError, match="warmup inference failed"):
+        startup.warmup("http://test", "qwen", 1)
