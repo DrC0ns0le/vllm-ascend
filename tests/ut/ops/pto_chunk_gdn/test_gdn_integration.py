@@ -40,6 +40,7 @@ def load_core(context, monkeypatch, saved):
         logger=logging.getLogger("gdn_contract"),
         get_pcp_group=lambda: SimpleNamespace(world_size=1),
         PAD_SLOT_ID=-1,
+        HEAD_DIM=128,
         DeviceOperator=SimpleNamespace(fused_gdn_gating=lambda A, a, b, bias: (a.unsqueeze(0), b.unsqueeze(0))),
         l2norm_fwd=lambda tensor: tensor,
         clear_ssm_states=lambda state, flags: state.masked_fill_(~flags[:, None, None, None], 0),
@@ -66,6 +67,58 @@ def layer():
         dt_bias=torch.zeros(1),
         rearrange_mixed_qkv=reshape,
     )
+
+
+@pytest.mark.parametrize("topology_supported", [False, True])
+def test_profile_prepares_from_local_tensor_geometry(monkeypatch, topology_supported):
+    model = layer()
+    model.num_v_heads, model.num_k_heads = 32, 16
+    query = torch.empty(1, 3, 8, 128)
+    value = torch.empty(1, 3, 16, 128)
+    model.rearrange_mixed_qkv = Mock(return_value=(query, query, value))
+    model.pto_gdn_backend = SimpleNamespace(topology_supported=topology_supported, prepare=Mock())
+    core, baseline, decode = load_core(SimpleNamespace(attn_metadata=None), monkeypatch, [])
+    core(model, torch.empty(3, 4096), torch.empty(3, 16), torch.empty(3, 16), torch.empty_like(value))
+    if topology_supported:
+        model.pto_gdn_backend.prepare.assert_called_once_with(query.device, 16, 8, 128)
+    else:
+        model.rearrange_mixed_qkv.assert_not_called()
+        model.pto_gdn_backend.prepare.assert_not_called()
+    baseline.assert_not_called()
+    decode.assert_not_called()
+
+
+@pytest.mark.parametrize("tp,pp,expected", [(1, 1, True), (2, 1, False), (4, 1, False), (1, 2, False)])
+def test_production_constructor_keeps_megagdn_tp1_pp1_only(tp, pp, expected):
+    path = Path(__file__).resolve().parents[4] / "vllm_ascend/ops/gdn.py"
+    tree = ast.parse(path.read_text())
+    cls = next(
+        node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "AscendGatedDeltaNetAttention"
+    )
+    cls.body = [node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "__init__"]
+
+    class Base:
+        def __init__(self):
+            self.tp_size = tp
+            self.prefix = "gdn"
+
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=pp, prefill_context_parallel_size=1, decode_context_parallel_size=1
+        ),
+        cache_config=SimpleNamespace(mamba_cache_mode="none"),
+        speculative_config=None,
+    )
+    factory = Mock()
+    namespace = dict(
+        GatedDeltaNetAttention=Base,
+        envs=SimpleNamespace(VLLM_ASCEND_PTO_CHUNK_GDN=True),
+        get_current_vllm_config=lambda: config,
+        MegaGDNBackend=factory,
+    )
+    exec(compile(ast.Module(body=[cls], type_ignores=[]), str(path), "exec"), namespace)
+    namespace["AscendGatedDeltaNetAttention"]()
+    factory.assert_called_once_with(topology_supported=expected, prefix="gdn")
 
 
 @pytest.mark.parametrize("enable_mega", [False, True])

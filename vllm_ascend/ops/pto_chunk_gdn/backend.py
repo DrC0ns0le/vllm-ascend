@@ -6,9 +6,20 @@ from collections import Counter
 
 import torch
 
-from vllm_ascend.ops.pto_chunk_gdn.eligibility import fallback_reason
+from vllm_ascend.ops.pto_chunk_gdn.eligibility import fallback_reason, total_chunks
 
 logger = logging.getLogger(__name__)
+
+
+def is_piecewise_runtime() -> bool:
+    # Resolve vLLM in the worker; importing the CPU eligibility helpers does
+    # not require initializing the serving runtime.
+    from vllm.config import CUDAGraphMode
+    from vllm.forward_context import get_forward_context, is_forward_context_available
+
+    if not is_forward_context_available():
+        return False
+    return get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE
 
 
 class MegaGDNBackend:
@@ -65,6 +76,8 @@ class MegaGDNBackend:
             reason = "device_mismatch"
         if reason is None and cu_seqlens.dtype not in (torch.int32, torch.int64):
             reason = "sequence_dtype"
+        if reason is None and not is_piecewise_runtime():
+            reason = "runtime_not_piecewise"
         if reason is None:
             # Compile failures propagate. Unsupported hardware falls back before
             # a dav-c220 binary can be launched on another NPU architecture.
@@ -73,9 +86,8 @@ class MegaGDNBackend:
                 reason = "hardware"
         if reason is not None:
             self.counts[f"fallback:{reason}"] += 1
-            if self.counts[f"fallback:{reason}"] == 1:
-                logger.warning("MegaGDN fallback: layer=%s reason=%s", self.prefix, reason)
             if logger.isEnabledFor(logging.DEBUG):
+                self._log_decision(reason, q, v, cu_host)
                 logger.debug("MegaGDN counters: layer=%s counts=%s", self.prefix, dict(self.counts))
             return fallback(
                 q=q,
@@ -99,15 +111,6 @@ class MegaGDNBackend:
 
             q, k = l2norm_fwd(q), l2norm_fwd(k)
         self.counts["megagdn"] += 1
-        if self.counts["megagdn"] == 1:
-            logger.info(
-                "MegaGDN selected: layer=%s H=%d Hg=%d D=%d C=128 dtype=%s",
-                self.prefix,
-                v.shape[2],
-                q.shape[2],
-                q.shape[3],
-                q.dtype,
-            )
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug("MegaGDN counters: layer=%s counts=%s", self.prefix, dict(self.counts))
         with torch.autograd.profiler.record_function("PTO_MegaGDN_prefill"):
@@ -122,7 +125,30 @@ class MegaGDNBackend:
                 scale=q.shape[-1] ** -0.5 if scale is None else scale,
                 return_final_state=True,
             )
+        if logger.isEnabledFor(logging.DEBUG):
+            self._log_decision("megagdn", q, v, cu_host)
         # Retain the baseline state dtype contract. The PTO accumulator itself
         # remains FP16 and must pass the separate numerical accuracy gate.
         state_dtype = q.dtype if initial_state is None else initial_state.dtype
         return output.to(q.dtype), state.to(state_dtype) if output_final_state else None
+
+    def _log_decision(self, reason, q, v, cu_host):
+        from vllm.forward_context import get_forward_context, is_forward_context_available
+
+        forward_context = get_forward_context() if is_forward_context_available() else None
+        descriptor = getattr(forward_context, "batch_descriptor", None)
+        runtime_mode = getattr(forward_context, "cudagraph_runtime_mode", None)
+        logger.debug(
+            "MegaGDN decision: layer=%s reason=%s mode=%s bucket=%s num_sequences=%s "
+            "total_tokens=%s total_chunks=%s H=%s Hg=%s D=%s",
+            self.prefix,
+            reason,
+            getattr(runtime_mode, "name", runtime_mode),
+            getattr(descriptor, "num_tokens", None),
+            len(cu_host) - 1 if cu_host is not None else None,
+            q.shape[1] if q.ndim > 1 else None,
+            total_chunks(cu_host) if cu_host is not None else None,
+            v.shape[2] if v.ndim > 2 else None,
+            q.shape[2] if q.ndim > 2 else None,
+            q.shape[3] if q.ndim > 3 else None,
+        )

@@ -871,6 +871,9 @@ AICORE void chunk_h_kernel(
       DynVecTile<half, HalfC, D> fs_store(HalfC, D);
       TASSIGN(fs_store, S_UB_HALF);
       TSTORE(fs_global, fs_store);
+      // Complete the store before the next work item reuses S_UB_HALF.
+      set_flag(PIPE_MTE3, PIPE_S, EVENT_ID0);
+      wait_flag(PIPE_MTE3, PIPE_S, EVENT_ID0);
     }
   }
 #endif

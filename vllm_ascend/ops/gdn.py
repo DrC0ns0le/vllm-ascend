@@ -185,8 +185,10 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         if attn_metadata is None:
             # V1 profile run
             backend = getattr(self, "pto_gdn_backend", None)
-            if backend is not None and backend.topology_supported and self.head_k_dim == self.head_v_dim == HEAD_DIM:
-                backend.prepare(mixed_qkv.device, self.num_v_heads, self.num_k_heads, self.head_k_dim)
+            if backend is not None and backend.topology_supported:
+                query, _, value = self.rearrange_mixed_qkv(mixed_qkv)
+                if query.shape[3] == value.shape[3] == HEAD_DIM:
+                    backend.prepare(query.device, value.shape[2], query.shape[2], query.shape[3])
             return
 
         assert isinstance(attn_metadata, dict)

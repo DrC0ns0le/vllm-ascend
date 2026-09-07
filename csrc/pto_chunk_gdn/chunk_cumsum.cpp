@@ -248,7 +248,8 @@ AICORE void cumsum_kernel(
         // TADD(dst, a, b): Element-wise add, like dst = a + b. All in UB.
         // Operates on all HTC elements in parallel (SIMD).
         TADD(acc_ub, acc_ub, g_row_i);
-        pipe_barrier(PIPE_V);
+        set_flag(PIPE_V, PIPE_S, EVENT_ID2);
+        wait_flag(PIPE_V, PIPE_S, EVENT_ID2);
 
         UbND<float, 1, HTC> s_row_i;
         TASSIGN(s_row_i, SUbAddr + i * RowBytes);
@@ -349,7 +350,8 @@ AICORE void cumsum_kernel(
             UbND<float, 1, HTC> g_row_i;
             TASSIGN(g_row_i, GUbAddr + i * RowBytes);
             TADD(acc_ub, acc_ub, g_row_i);
-            pipe_barrier(PIPE_V);
+            set_flag(PIPE_V, PIPE_S, EVENT_ID2);
+            wait_flag(PIPE_V, PIPE_S, EVENT_ID2);
 
             UbND<float, 1, HTC> s_row_i;
             TASSIGN(s_row_i, SUbAddr + i * RowBytes);
