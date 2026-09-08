@@ -60,6 +60,8 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
             tl.load(cu_seqlens + i_n + 1).to(tl.int32),
         )
         T = eos - bos
+        if T <= 0:
+            return
         NT = tl.cdiv(T, BT)
         boh = tl.load(chunk_offsets + i_n).to(tl.int32)
     else:
@@ -113,7 +115,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
 
         k_base = k + bos * Hg * K + (i_h // (H // Hg)) * K
         p_k = tl.make_block_ptr(k_base, (K, T), (1, stride_k), (0, i_t * BT), (128, BT), (0, 1))
-        b_k = tl.load(p_k, boundary_check=(0, 1))
+        b_k = tl.load(p_k, boundary_check=(0, 1), padding_option="zero")
 
         v_new_base = v_new + bos * H * V + i_h * V
 
@@ -211,7 +213,6 @@ def chunk_gated_delta_rule_fwd_h(
     assert K <= 256, "current kernel does not support head dimension larger than 256."
 
     h = k.new_empty(B, NT, H, K, V)
-    h_update = k.new_empty(B, NT, H, K, K)
     final_state = k.new_empty(N, H, K, V, dtype=torch.float32) if output_final_state else None
 
     v_new = torch.empty_like(u) if save_new_value else None
@@ -231,7 +232,7 @@ def chunk_gated_delta_rule_fwd_h(
         ht=final_state,
         cu_seqlens=cu_seqlens,
         chunk_offsets=chunk_offsets,
-        h_update=h_update,
+        h_update=None,
         T=T,
         H=H,
         Hg=Hg,

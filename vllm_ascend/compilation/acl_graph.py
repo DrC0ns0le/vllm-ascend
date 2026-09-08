@@ -356,6 +356,15 @@ def update_graph_params_workspaces(num_tokens: int, workspace: torch.Tensor):
 
 
 def get_graph_params():
+    # Native prefill/mixed graphs own their handles and metadata separately
+    # from decode's token-count cache. Two packed layouts can have the same
+    # token count; sharing handles would update the wrong captured graph.
+    try:
+        params = getattr(get_forward_context(), "full_prefill_graph_params", None)
+    except (AssertionError, LookupError, RuntimeError):
+        params = None
+    if params is not None:
+        return params
     return _select_graph_params(_graph_params)
 
 

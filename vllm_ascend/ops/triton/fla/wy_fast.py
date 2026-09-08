@@ -40,17 +40,21 @@ def recompute_w_u_fwd_kernel(
 ):
     T_max = T
     i_t_o = tl.program_id(0)
+    if IS_VARLEN:
+        i_n, i_t = (
+            tl.load(chunk_indices + i_t_o * 2).to(tl.int32),
+            tl.load(chunk_indices + i_t_o * 2 + 1).to(tl.int32),
+        )
+        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+        T = eos - bos
+        if T <= 0:
+            return
+    else:
+        i_t = i_t_o
 
     for i_bh in range(H):
         i_b, i_h = i_bh // H, i_bh % H
-        if IS_VARLEN:
-            i_n, i_t = (
-                tl.load(chunk_indices + i_t_o * 2).to(tl.int32),
-                tl.load(chunk_indices + i_t_o * 2 + 1).to(tl.int32),
-            )
-            bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
-            T = eos - bos
-        else:
+        if not IS_VARLEN:
             bos, eos = i_b * T, i_b * T + T
 
         offs_t = tl.arange(0, BT)

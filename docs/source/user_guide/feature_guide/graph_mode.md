@@ -265,6 +265,75 @@ vllm serve path/to/Qwen3-32B \
 
 For more details about Xlite, see the [Xlite README](https://atomgit.com/openeuler/GVirt/blob/master/xlite/README.md).
 
+## Qwen3.5 FULL Prefill and Mixed Capture
+
+On Ascend 910B, the MRV1 breakable ACLGraph wrapper can capture fresh prefill,
+continuation prefill, and mixed prefill/decode batches, including the baseline
+GDN core, as one graph with no eager breaks. New requests can therefore join
+ongoing requests through the existing scheduler. MegaGDN remains on the
+PIECEWISE path. Decode continues
+using its existing FULL graph path. Hardware correctness and performance
+validation of this prefill path is still required.
+
+This path requires TP/PP/DP/PCP/DCP size 1, `mamba_cache_mode="none"`, and no
+speculative decoding, LoRA, KV transfer, C8 attention, attention sinks, or ENPU.
+Keep the existing `FULL_AND_PIECEWISE` configuration:
+the wrapper selects FULL prefill capture from eligible PIECEWISE dispatches.
+
+For the target 128-dimension GDN model, prefill graphs specialize on the
+**token bucket**, with request capacity fixed to `max_num_seqs` (up to 64).
+Request arrivals, changing query lengths, fresh/stateful flags, and the
+prefill/decode split reuse the same graph within that bucket. GDN processes
+all requests through one packed baseline route. Chunk tables and state
+read/write indices are device tensors; the Triton state/output stages replace
+the AscendC stages that require host query/chunk attributes. Empty sentinel
+sequences make unused chunk tasks inert, and padded requests never write state.
+
+FIA query and KV lengths are refreshed through the existing attention
+task-update API. A dummy sequence consumes token padding; its output is
+discarded and its KV slots are `-1`. Both real and dummy block-table rows
+have graph-owned storage. Each
+entry owns its attention handles, events, workspaces, and metadata/table
+buffers; entries cannot overwrite decode's graph parameters or another
+prefill layout's handles at the same token count.
+
+Replay copies current tokens, positions, KV slots, and recurrent-state indices
+into private graph buffers. On a mixed/stateful cache miss, active convolution
+and SSM rows are saved on device and restored after warmup and capture. The
+first replay advances the existing state exactly once. These temporary copies
+are released after capture; steady replay uses the normal GDN state cache.
+
+The default capacity cache has room for every configured token bucket
+(at least 8 entries). Unsupported geometries retain the earlier
+layout-specialized path, limited to 8 entries by default. New entries beyond
+the configured limit use PIECEWISE without evicting existing graphs.
+Set `full_prefill_graph_max_entries` in
+`--additional-config` to change this non-negative limit; `0` disables FULL
+prefill capture. The first use of an admitted layout includes warmup and
+capture, so performance validation should distinguish capture from replay.
+
+This preserves the standard decode-only FULL
+dispatch invariant described in [vLLM #55123](https://github.com/vllm-project/vllm/pull/55123).
+The next metadata backend should consume the device-side FIA tiling interface
+in [Ascend #15336](https://github.com/vllm-project/vllm-ascend/pull/15336), whose
+custom operators are not present in this checkout. GDN metadata is already
+device-driven; FIA still uses host task updates. Persistent per-entry buffer ownership
+follows the same constraint highlighted by
+[Ascend #15246](https://github.com/vllm-project/vllm-ascend/pull/15246).
+
+Continuation here uses `mamba_cache_mode="none"` and the existing single state
+anchor. All-mode prefix caching, block checkpoints, and separate read/write
+anchors from [vLLM #54637](https://github.com/vllm-project/vllm/pull/54637) and
+[#26807](https://github.com/vllm-project/vllm/pull/26807) are not implemented;
+their metadata is rejected by this capture path until the corresponding
+Ascend kernels and builder integration are available. No alternate block or
+checkpoint manager is introduced. CPU contract tests cover routing, capture
+rollback, stateful GDN slicing/writeback, request arrivals within one captured
+bucket, and attention metadata ownership. The Triton state/output kernels
+also run under CPU pointer emulation against a recurrent numerical reference
+with poisoned padding. This does not validate Triton compilation on Ascend:
+NPU arithmetic, capture legality, and performance remain unvalidated.
+
 ## Common Limitations and Caveats
 
 - XliteGraph should be treated as an alternative graph path, not as a drop-in replacement for ACLGraph in all scenarios.

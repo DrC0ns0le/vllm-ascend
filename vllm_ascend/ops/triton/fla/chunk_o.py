@@ -75,11 +75,11 @@ def chunk_fwd_kernel_o(
             p_k = tl.make_block_ptr(k, (K, T), (1, Hg * K), (i_k * BK, i_t * BT), (BK, BT), (0, 1))
             p_h = tl.make_block_ptr(h_base, (K, V), (V, 1), (i_k * BK, i_v * BV), (BK, BV), (1, 0))
             # [BT, BK]
-            b_q = tl.load(p_q, boundary_check=(0, 1))
+            b_q = tl.load(p_q, boundary_check=(0, 1), padding_option="zero")
             # [BK, BT]
-            b_k = tl.load(p_k, boundary_check=(0, 1))
+            b_k = tl.load(p_k, boundary_check=(0, 1), padding_option="zero")
             # [BK, BV]
-            b_h = tl.load(p_h, boundary_check=(0, 1))
+            b_h = tl.load(p_h, boundary_check=(0, 1), padding_option="zero")
 
             # [BT, BK] @ [BK, BV] -> [BT, BV]
             b_o += tl.dot(b_q, b_h)
@@ -102,7 +102,7 @@ def chunk_fwd_kernel_o(
         p_v = tl.make_block_ptr(v, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
         p_o = tl.make_block_ptr(o, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
 
-        b_v = tl.load(p_v, boundary_check=(0, 1))
+        b_v = tl.load(p_v, boundary_check=(0, 1), padding_option="zero")
         # to fix mma -> mma layout conversion
         # already solved by fla v3.2 or higher
         b_o = b_o * scale + tl.dot(b_A.to(b_v.dtype), b_v) * scale
@@ -119,6 +119,7 @@ def chunk_fwd_o(
     cu_seqlens: torch.LongTensor | None = None,
     chunk_size: int = 64,
     chunk_offsets: torch.Tensor | None = None,
+    output: torch.Tensor | None = None,
 ) -> torch.Tensor:
     B, T, Hg, K, V = *q.shape, v.shape[-1]
     H = v.shape[-2]
@@ -127,7 +128,7 @@ def chunk_fwd_o(
     if scale is None:
         scale = k.shape[-1] ** -0.5
 
-    o = torch.empty_like(v)
+    o = torch.empty_like(v) if output is None else output
     if cu_seqlens is None:
         N, chunk_offsets = B, None
     else:

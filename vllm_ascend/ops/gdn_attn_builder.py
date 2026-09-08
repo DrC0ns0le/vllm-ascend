@@ -33,7 +33,6 @@ from vllm.v1.attention.backends.utils import (
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
 
-from vllm_ascend import envs
 from vllm_ascend.ops.triton.fla.utils import (
     prepare_chunk_indices,
     prepare_chunk_offsets,
@@ -750,7 +749,7 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                 prefill_query_start_loc_cpu,
                 query_start_loc.device,
             )
-            if envs.VLLM_ASCEND_PTO_CHUNK_GDN and spec_sequence_masks is None:
+            if spec_sequence_masks is None:
                 seq_lens_cpu = m.seq_lens_cpu_upper_bound
                 if seq_lens_cpu is not None and seq_lens_cpu.device.type == "cpu":
                     # An upper bound equal to the scheduled query length proves

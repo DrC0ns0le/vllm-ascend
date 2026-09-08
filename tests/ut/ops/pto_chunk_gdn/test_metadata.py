@@ -25,12 +25,13 @@ def test_cpu_metadata_proves_freshness_for_only_prefill_slice(upper, starts, dec
     block = next(
         node
         for node in ast.walk(tree)
-        if isinstance(node, ast.If) and "envs.VLLM_ASCEND_PTO_CHUNK_GDN" in ast.unparse(node.test)
+        if isinstance(node, ast.If)
+        and ast.unparse(node.test) == "spec_sequence_masks is None"
+        and "non_spec_chunked_prefill_metadata.fresh_prefill" in ast.unparse(node)
     )
     metadata = SimpleNamespace(fresh_prefill=False)
     namespace = dict(
         torch=torch,
-        envs=SimpleNamespace(VLLM_ASCEND_PTO_CHUNK_GDN=True),
         m=SimpleNamespace(seq_lens_cpu_upper_bound=None if upper is None else torch.tensor(upper)),
         spec_sequence_masks=spec,
         num_decodes=decodes,

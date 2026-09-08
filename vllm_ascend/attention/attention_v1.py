@@ -199,6 +199,9 @@ class AscendMetadata:
     model_runner_type: str = ""
     # prefill reshape_and_cache event
     reshape_cache_event: torch.npu.Event = None
+    # Native mixed graphs pass padded Q/K/V and mark inactive KV slots -1.
+    # Keep num_actual_tokens as the scheduler's live count for bookkeeping.
+    full_graph_token_capacity: int = 0
 
 
 class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
@@ -481,8 +484,9 @@ class AscendAttentionBackendImpl(AttentionImpl):
         speculative_config=None,
         draft_attn_metadatas=None,
     ):
-        use_layer_aware_replay = needs_layer_aware_fia_graph_replay()
-        if using_paged_attention(num_tokens, vllm_config):
+        full_prefill = getattr(forward_context, "full_prefill_graph_params", None) is not None
+        use_layer_aware_replay = full_prefill or needs_layer_aware_fia_graph_replay()
+        if not full_prefill and using_paged_attention(num_tokens, vllm_config):
             # Paged Attention update logic
             if _EXTRA_CTX.is_draft_model:
                 if _EXTRA_CTX.is_draft_model_prefill:
@@ -894,7 +898,9 @@ class AscendAttentionBackendImpl(AttentionImpl):
             output = output.unsqueeze(2)
             attn_mask = None
             sparse_mode = 0
-        use_max_workspace = self._use_max_workspace_for_fia_graph
+        use_max_workspace = (
+            self._use_max_workspace_for_fia_graph or getattr(_EXTRA_CTX, "full_prefill_graph_params", None) is not None
+        )
         workspace = graph_params.workspaces.get(num_tokens)
         should_update_workspace_cache = False
         if use_max_workspace:
@@ -985,7 +991,10 @@ class AscendAttentionBackendImpl(AttentionImpl):
             )  # type: ignore
         else:
             attn_params = attn_params + (None, None, None, None)  # type: ignore
-        layer_name = self._graph_metadata_layer_name(layer) if self._use_layer_aware_fia_graph_replay else None
+        full_prefill = getattr(_EXTRA_CTX, "full_prefill_graph_params", None) is not None
+        layer_name = (
+            self._graph_metadata_layer_name(layer) if self._use_layer_aware_fia_graph_replay or full_prefill else None
+        )
         attn_params = attn_params + (layer_name,)  # type: ignore
         graph_params.attn_params[num_tokens].append(attn_params)
 
@@ -1282,12 +1291,19 @@ class AscendAttentionBackendImpl(AttentionImpl):
         # runner v2, there is not capturing attribute in forward_context,
         # just use getattr to avoid attribute error.
         if _EXTRA_CTX.capturing:
+            # A mixed/prefill token bucket can exceed the live query count.
+            # FIA's output and cumulative lengths must describe the same T.
+            capture_output = output
+            if getattr(_EXTRA_CTX, "full_prefill_graph_params", None) is not None:
+                num_tokens = attn_metadata.actual_seq_lengths_q[-1]
+                query = query[:num_tokens]
+                capture_output = output[:num_tokens]
             if self.sinks is not None:
-                attn_output, num_tokens = self.full_graph_fia_v2(query, key, value, attn_metadata, output)
+                attn_output, num_tokens = self.full_graph_fia_v2(query, key, value, attn_metadata, capture_output)
                 output[:num_tokens] = attn_output[:num_tokens]
                 return output
             else:
-                attn_output, num_tokens = self.full_graph_fia(query, key, value, attn_metadata, output)
+                attn_output, num_tokens = self.full_graph_fia(query, key, value, attn_metadata, capture_output)
                 output[:num_tokens] = attn_output[:num_tokens]
                 return output
         passed_value = value
@@ -1570,14 +1586,15 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 return query, key, value, output
             slots = attn_metadata.slot_mapping
             encoder_decoder = self.attn_type == AttentionType.ENCODER_DECODER
+            cache_tokens = attn_metadata.full_graph_token_capacity or attn_metadata.num_actual_tokens
             DeviceOperator.reshape_and_cache(
-                key=key[: attn_metadata.num_actual_tokens] if not encoder_decoder else key,
-                value=value[: attn_metadata.num_actual_tokens] if not encoder_decoder else value,
+                key=key[:cache_tokens] if not encoder_decoder else key,
+                value=value[:cache_tokens] if not encoder_decoder else value,
                 key_cache=self.key_cache,
                 value_cache=self.value_cache,
                 # quick fix to make sure slots is int32 for cross attention case.
                 # see: https://github.com/vllm-project/vllm/blob/ce88756b967c2c5006746a424c15dd59a284ed8c/vllm/model_executor/layers/attention/cross_attention.py#L117
-                slot_mapping=slots[: attn_metadata.num_actual_tokens] if not encoder_decoder else slots.to(torch.int32),
+                slot_mapping=slots[:cache_tokens] if not encoder_decoder else slots.to(torch.int32),
             )
             notify_kv_cache_written()
         return query, key, value, output
@@ -1629,7 +1646,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
             shape = [num_tokens, num_heads * head_size]
         """
         assert output is not None, "Output tensor must be provided."
-        if self._use_layer_aware_fia_graph_replay:
+        if self._use_layer_aware_fia_graph_replay or getattr(_EXTRA_CTX, "full_prefill_graph_params", None) is not None:
             self._layer_name = layer.layer_name
 
         if output_scale is not None or output_block_scale is not None:

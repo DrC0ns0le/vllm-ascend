@@ -36,6 +36,7 @@ def load_core(context, monkeypatch, saved):
         torch=torch,
         get_forward_context=lambda: context,
         GDNAttentionMetadata=SimpleNamespace,
+        GDNFullGraphMetadata=type("GDNFullGraphMetadata", (), {}),
         logging=logging,
         logger=logging.getLogger("gdn_contract"),
         get_pcp_group=lambda: SimpleNamespace(world_size=1),
@@ -122,14 +123,18 @@ def test_production_constructor_keeps_megagdn_tp1_pp1_only(tp, pp, expected):
 
 
 @pytest.mark.parametrize("enable_mega", [False, True])
-def test_mixed_batch_only_sends_prefill_slice_and_rebased_state_to_backend(monkeypatch, enable_mega):
+@pytest.mark.parametrize("full_graph", [False, True])
+@pytest.mark.parametrize("stateful", [False, True])
+def test_mixed_batch_only_sends_prefill_slice_and_rebased_state_to_backend(
+    monkeypatch, enable_mega, full_graph, stateful
+):
     model = layer()
     before = model.kv_cache[1].clone()
     saved = []
     conv = SimpleNamespace(
         query_start_loc=torch.tensor([0, 1, 4]),
         cache_indices=torch.tensor([2, 0]),
-        initial_state_mode=torch.tensor([True, False]),
+        initial_state_mode=torch.tensor([True, stateful]),
     )
     metadata = SimpleNamespace(
         spec_sequence_masks=None,
@@ -141,32 +146,39 @@ def test_mixed_batch_only_sends_prefill_slice_and_rebased_state_to_backend(monke
         num_decodes=1,
         num_prefills=1,
         num_decode_tokens=1,
-        non_spec_prefill_metadata=SimpleNamespace(causal_conv1d=conv, chunk=SimpleNamespace(fresh_prefill=True)),
+        non_spec_prefill_metadata=SimpleNamespace(
+            causal_conv1d=conv, chunk=SimpleNamespace(fresh_prefill=not stateful)
+        ),
         non_spec_decode_metadata=SimpleNamespace(actual_seq_lengths=torch.tensor([0, 1])),
         prefill_query_start_loc=torch.tensor([0, 3]),
         prefill_state_indices=torch.tensor([0]),
-        prefill_has_initial_state=torch.tensor([False]),
+        prefill_has_initial_state=torch.tensor([stateful]),
     )
-    core, baseline, decode = load_core(SimpleNamespace(attn_metadata={"gdn": metadata}), monkeypatch, saved)
+    core, baseline, decode = load_core(
+        SimpleNamespace(attn_metadata={"gdn": metadata}, full_prefill_graph=full_graph), monkeypatch, saved
+    )
     if enable_mega:
         model.pto_gdn_backend = Mock(side_effect=lambda **kwargs: (kwargs["v"] + 10, kwargs["initial_state"] + 5))
     inputs = torch.arange(12).reshape(6, 2).float()
     output = torch.zeros(6, 1, 2)
     core(model, inputs, torch.zeros(6, 1), torch.zeros(6, 1), output)
-    selected = model.pto_gdn_backend if enable_mega else baseline
+    selected = model.pto_gdn_backend if enable_mega and not full_graph else baseline
     selected.assert_called_once()
     passed = selected.call_args.kwargs
     torch.testing.assert_close(passed["v"].squeeze(0).squeeze(1), inputs[1:4])
-    torch.testing.assert_close(passed["initial_state"], torch.zeros(1, 1, 2, 2))
+    initial_state = before[:1].transpose(-1, -2) if stateful else torch.zeros(1, 1, 2, 2)
+    torch.testing.assert_close(passed["initial_state"], initial_state)
     torch.testing.assert_close(passed["cu_seqlens"], torch.tensor([0, 3]))
-    if enable_mega:
-        assert passed["fresh_prefill"] is True
+    if enable_mega and not full_graph:
+        assert passed["fresh_prefill"] is not stateful
         baseline.assert_not_called()
+    elif enable_mega:
+        model.pto_gdn_backend.assert_not_called()
     torch.testing.assert_close(decode.call_args.kwargs["ssm_state_indices"], torch.tensor([2]))
     torch.testing.assert_close(output[0, 0], inputs[0] + 20)
     torch.testing.assert_close(output[1:4, 0], inputs[1:4] + 10)
     torch.testing.assert_close(output[4:], torch.zeros_like(output[4:]))
-    torch.testing.assert_close(model.kv_cache[1][0], torch.full((1, 2, 2), 5.0))
+    torch.testing.assert_close(model.kv_cache[1][:1], (initial_state + 5).transpose(-1, -2))
     torch.testing.assert_close(model.kv_cache[1][1:], before[1:])
     assert saved == ["saved"]
 
@@ -195,3 +207,94 @@ def test_pure_decode_does_not_call_megagdn(monkeypatch):
     decode.assert_called_once()
     baseline.assert_not_called()
     model.pto_gdn_backend.assert_not_called()
+
+
+@pytest.mark.parametrize("stateful", [False, True])
+def test_full_prefill_captures_baseline_even_when_megagdn_is_enabled(monkeypatch, stateful):
+    model = layer()
+    before = model.kv_cache[1].clone()
+    model.pto_gdn_backend = Mock(side_effect=AssertionError("phase 1 captures baseline GDN"))
+    conv = SimpleNamespace(
+        query_start_loc=torch.tensor([0, 3]),
+        cache_indices=torch.tensor([1]),
+        initial_state_mode=torch.tensor([stateful]),
+    )
+    metadata = SimpleNamespace(
+        spec_sequence_masks=None,
+        spec_token_indx=None,
+        non_spec_token_indx=None,
+        spec_state_indices_tensor=None,
+        non_spec_state_indices_tensor=torch.tensor([1]),
+        num_actual_tokens=3,
+        num_decodes=0,
+        num_prefills=1,
+        num_decode_tokens=0,
+        non_spec_prefill_metadata=SimpleNamespace(
+            causal_conv1d=conv, chunk=SimpleNamespace(fresh_prefill=not stateful)
+        ),
+        prefill_query_start_loc=torch.tensor([0, 3]),
+        prefill_state_indices=torch.tensor([1]),
+        prefill_has_initial_state=torch.tensor([stateful]),
+    )
+    core, baseline, decode = load_core(
+        SimpleNamespace(attn_metadata={"gdn": metadata}, full_prefill_graph=True), monkeypatch, []
+    )
+    inputs = torch.arange(6).reshape(3, 2).float()
+    output = torch.zeros(3, 1, 2)
+    core(model, inputs, torch.zeros(3, 1), torch.zeros(3, 1), output)
+    baseline.assert_called_once()
+    model.pto_gdn_backend.assert_not_called()
+    decode.assert_not_called()
+    torch.testing.assert_close(output[:, 0], inputs + 10)
+    expected = before[1] + 5 if stateful else torch.full((1, 2, 2), 5.0)
+    torch.testing.assert_close(model.kv_cache[1][1], expected)
+    # The next prompt chunk must consume the state written by this chunk.
+    metadata.prefill_has_initial_state.fill_(True)
+    core(model, inputs, torch.zeros(3, 1), torch.zeros(3, 1), output)
+    torch.testing.assert_close(model.kv_cache[1][1], expected + 5)
+
+
+def test_capacity_metadata_dispatches_before_host_prefill_decode_splitting(monkeypatch):
+    context = SimpleNamespace(attn_metadata={})
+    core, baseline, decode = load_core(context, monkeypatch, [])
+    metadata = core.__globals__["GDNFullGraphMetadata"]()
+    context.attn_metadata["gdn"] = metadata
+    model = layer()
+    model._forward_full_graph = Mock()
+    data, gates, output = torch.zeros(8, 2), torch.zeros(8, 1), torch.zeros(8, 1, 2)
+    core(model, data, gates, gates, output)
+    model._forward_full_graph.assert_called_once_with(data, gates, gates, output, metadata)
+    baseline.assert_not_called()
+    decode.assert_not_called()
+
+
+def test_full_graph_core_passes_whole_capacity_and_device_state_flags(monkeypatch):
+    path = Path(__file__).resolve().parents[4] / "vllm_ascend/ops/gdn.py"
+    tree = ast.parse(path.read_text())
+    method = next(
+        node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "_forward_full_graph"
+    )
+    model = layer()
+    conv = Mock(side_effect=lambda output, data, *args, **kwargs: output.copy_(data))
+    monkeypatch.setattr(torch.ops._C_ascend, "npu_causal_conv1d_custom", conv, raising=False)
+    graph = Mock(side_effect=lambda q, k, v, g, beta, state, metadata, *, output: output.copy_(v + 7))
+    namespace = dict(
+        torch=torch,
+        PAD_SLOT_ID=-1,
+        chunk_gated_delta_rule_graph=graph,
+        DeviceOperator=SimpleNamespace(fused_gdn_gating=lambda log, a, b, bias: (a.unsqueeze(0), b.unsqueeze(0))),
+    )
+    exec(compile(ast.Module(body=[method], type_ignores=[]), str(path), "exec"), namespace)
+    metadata = SimpleNamespace(
+        query_start_loc=torch.tensor([0, 1, 4, 6, 6]),
+        state_write_indices=torch.tensor([2, 0, 1, -1]),
+        has_initial_state=torch.tensor([True, False, True, False]),
+    )
+    data, gates, output = torch.arange(16).reshape(8, 2).float(), torch.zeros(8, 1), torch.zeros(8, 1, 2)
+    namespace["_forward_full_graph"](model, data, gates, gates, output, metadata)
+    assert conv.call_args.kwargs["run_mode"] == 0
+    assert conv.call_args.kwargs["query_start_loc_opt"] is metadata.query_start_loc
+    assert conv.call_args.kwargs["initial_state_mode_opt"] is metadata.has_initial_state
+    assert graph.call_args.args[-1] is metadata
+    assert graph.call_args.args[0].shape == (1, 8, 1, 2)
+    torch.testing.assert_close(output[:, 0], data + 7)

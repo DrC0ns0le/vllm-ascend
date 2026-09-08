@@ -43,6 +43,8 @@ def solve_tril_16x16_kernel(
             tl.load(cu_seqlens + i_n + 1).to(tl.int32),
         )
         T = eos - bos
+        if T <= 0:
+            return
     else:
         bos, eos = i_b * T, i_b * T + T
 
@@ -159,6 +161,8 @@ def merge_16x16_to_32x32_inverse_kernel(
             tl.load(cu_seqlens + i_n + 1).to(tl.int32),
         )
         T = eos - bos
+        if T <= 0:
+            return
     else:
         bos, eos = i_b * T, i_b * T + T
 
@@ -173,9 +177,9 @@ def merge_16x16_to_32x32_inverse_kernel(
     p_Ai_22 = tl.make_block_ptr(Ai, (T, 32), (H * 32, 1), (i_t * 32 + 16, 16), (16, 16), (1, 0))
     p_Ai_21 = tl.make_block_ptr(Ai, (T, 32), (H * 32, 1), (i_t * 32 + 16, 0), (16, 16), (1, 0))
 
-    A_21 = tl.load(p_A_21, boundary_check=(0, 1)).to(tl.float32)
-    Ai_11 = tl.load(p_Ad_11, boundary_check=(0, 1)).to(tl.float32)
-    Ai_22 = tl.load(p_Ad_22, boundary_check=(0, 1)).to(tl.float32)
+    A_21 = tl.load(p_A_21, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
+    Ai_11 = tl.load(p_Ad_11, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
+    Ai_22 = tl.load(p_Ad_22, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
     Ai_21 = -tl.dot(
         tl.dot(Ai_22, A_21, input_precision="ieee"),
         Ai_11,
@@ -223,6 +227,8 @@ def merge_16x16_to_64x64_inverse_kernel(
             tl.load(cu_seqlens + i_n + 1).to(tl.int32),
         )
         T = eos - bos
+        if T <= 0:
+            return
         i_t = i_t_val
     else:
         bos, eos = i_b * T, i_b * T + T
