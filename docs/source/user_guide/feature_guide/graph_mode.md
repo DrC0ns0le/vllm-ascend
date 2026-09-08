@@ -289,6 +289,30 @@ read/write indices are device tensors; the Triton state/output stages replace
 the AscendC stages that require host query/chunk attributes. Empty sentinel
 sequences make unused chunk tasks inert, and padded requests never write state.
 
+Within this graph, device query lengths select a direct recurrent GDN kernel
+for single-token requests, including fresh requests. These rows bypass the
+prefill chunk tables and packed state copies; longer requests retain the
+chunked path. Both paths are captured together and write disjoint rows, so
+changing the decode/prefill mix does not require a new graph specialization.
+
+Metadata refresh uses one device launch per shared GDN metadata group for
+query boundaries, state slots, initial-state flags, and all three chunk tables.
+FIA query boundaries, KV slots, and block tables are also refreshed in one
+launch per shared attention metadata group. Request count and live token count
+are runtime scalars, so arrivals and ragged continuation chunks do not create
+new metadata-kernel specializations. This replaces eight tensor operations and
+three GDN metadata launches, plus seven FIA buffer operations; it does not
+remove FIA's per-layer host task updates or the replay synchronization they
+currently require. Latency improvements still need measurement on Ascend.
+The standard builder's CPU sequence-length fields share one persistent tensor,
+avoiding a duplicate host tensor allocation and copy on each refresh.
+
+For short prompts and outputs, the first use of a token bucket still pays
+lazy capture cost. Warmup should cover the aggregate batch token buckets,
+not just the maximum length of one prompt. In particular, prompts shorter
+than 768 tokens can collectively fill a larger bucket under concurrent load.
+The default scheduler and aggregate capture sizes are unchanged.
+
 FIA query and KV lengths are refreshed through the existing attention
 task-update API. A dummy sequence consumes token padding; its output is
 discarded and its KV slots are `-1`. Both real and dummy block-table rows
@@ -333,6 +357,9 @@ bucket, and attention metadata ownership. The Triton state/output kernels
 also run under CPU pointer emulation against a recurrent numerical reference
 with poisoned padding. This does not validate Triton compilation on Ascend:
 NPU arithmetic, capture legality, and performance remain unvalidated.
+Single-token recurrence tests also cover 4, 10, and 64 consecutive updates
+with reordered requests, cache-slot reuse, grouped heads, and strided state
+and gate tensors, including exact preservation of inactive slots.
 
 ## Common Limitations and Caveats
 

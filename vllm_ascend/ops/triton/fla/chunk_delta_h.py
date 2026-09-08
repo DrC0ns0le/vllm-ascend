@@ -50,6 +50,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     STORE_FINAL_STATE: tl.constexpr,
     SAVE_NEW_VALUE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    SKIP_SINGLE_TOKEN: tl.constexpr = False,
 ):
     i_nh = tl.program_id(1)
     i_n, i_h = i_nh // H, i_nh % H
@@ -60,7 +61,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
             tl.load(cu_seqlens + i_n + 1).to(tl.int32),
         )
         T = eos - bos
-        if T <= 0:
+        if T <= 0 or (SKIP_SINGLE_TOKEN and T == 1):
             return
         NT = tl.cdiv(T, BT)
         boh = tl.load(chunk_offsets + i_n).to(tl.int32)
@@ -190,6 +191,7 @@ def chunk_gated_delta_rule_fwd_h(
     cu_seqlens: torch.LongTensor | None = None,
     chunk_indices: torch.Tensor | None = None,
     chunk_offsets: torch.Tensor | None = None,
+    skip_single_token: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # This kernel is slightly different from fla to support Q/K with different head numbers.
     # In fla, Q/K always have the same head number, so Hg is always equal to H.
@@ -239,6 +241,7 @@ def chunk_gated_delta_rule_fwd_h(
         K=K,
         V=V,
         BT=BT,
+        SKIP_SINGLE_TOKEN=skip_single_token,
         num_warps=4,
         num_stages=2,
     )

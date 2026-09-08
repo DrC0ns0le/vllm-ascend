@@ -39,7 +39,9 @@ def load_source(path, names, namespace):
 
 class Pointer:
     def __init__(self, tensor, offset=0):
-        self.tensor, self.offset = tensor.reshape(-1), torch.as_tensor(offset)
+        size = tensor.untyped_storage().nbytes() // tensor.element_size()
+        self.tensor = tensor.as_strided((size,), (1,), storage_offset=0)
+        self.offset = torch.as_tensor(offset) + tensor.storage_offset()
         self.dtype = SimpleNamespace(element_ty=tensor.dtype)
 
     def __add__(self, offset):
@@ -68,6 +70,7 @@ class TensorLanguage:
     int64 = torch.int64
     float32 = torch.float32
     arange = staticmethod(torch.arange)
+    static_range = staticmethod(range)
     cumsum = staticmethod(
         lambda x, axis, reverse=False: x.flip((axis,)).cumsum(axis).flip((axis,)) if reverse else x.cumsum(axis)
     )
@@ -94,11 +97,9 @@ class TensorLanguage:
             # Poison undefined padding so a missing zero-fill is observable.
             other = 0 if padding_option == "zero" else float("nan")
         offsets, mask = torch.broadcast_tensors(pointer.offset, torch.as_tensor(mask))
-        return torch.where(
-            mask,
-            pointer.tensor[torch.where(mask, offsets, 0).long()],
-            torch.as_tensor(other, dtype=pointer.tensor.dtype),
-        )
+        result = torch.broadcast_to(torch.as_tensor(other, dtype=pointer.tensor.dtype), offsets.shape).clone()
+        result[mask] = pointer.tensor[offsets[mask].long()]
+        return result
 
     @staticmethod
     def store(pointer, values, mask=True, boundary_check=()):
@@ -159,22 +160,45 @@ def graph_code():
     )
     namespace["_chunk_metadata_kernel"] = Launch(namespace["_chunk_metadata_kernel"], tl)
     namespace["_state_transfer_kernel"] = Launch(namespace["_state_transfer_kernel"], tl)
+    namespace["VALUE_TILE"] = 32
+    load_source(
+        "vllm_ascend/ops/triton/fla/single_token.py", {"_single_token_gdn_kernel", "single_token_gdn"}, namespace
+    )
+    namespace["_single_token_gdn_kernel"] = Launch(namespace["_single_token_gdn_kernel"], tl)
     return namespace
 
 
-@pytest.mark.parametrize("lengths", [[1, 65, 127], [64, 128], [1] * 64, [1217, 1, 1], [1536], [1, 0, 63, 0, 64]])
-def test_chunk_tables_cover_each_real_chunk_once_and_pad_with_empty_sequence(graph_code, lengths):
+@pytest.mark.parametrize("heads", [1, 16, 32, 64])
+@pytest.mark.parametrize("skip_single_token", [False, True])
+@pytest.mark.parametrize("lengths", [[], [1, 65, 127], [64, 128], [1] * 64, [1217, 1, 1], [1536], [1, 0, 63, 0, 64]])
+def test_chunk_tables_cover_each_real_chunk_once_and_pad_with_empty_sequence(
+    graph_code, lengths, heads, skip_single_token
+):
     code = graph_code
-    target = code["allocate_graph_metadata"](2048, 64, 16, "cpu")
-    cu = torch.tensor([0, *torch.tensor(lengths).cumsum(0).tolist()])
+    target = code["allocate_graph_metadata"](2048, 64, heads, "cpu")
+    cu = torch.tensor([0, *torch.tensor(lengths, dtype=torch.int64).cumsum(0).tolist()])
     indices = torch.arange(len(lengths), dtype=torch.int32)
-    code["update_graph_metadata"](target, cu, indices, torch.ones(len(lengths), dtype=torch.bool), 16)
-    for table, chunk in ((target.chunk_indices, 64), (target.solve_indices, 1216), (target.cumsum_indices, 256)):
-        expected = [(seq, block) for seq, length in enumerate(lengths) for block in range(math.ceil(length / chunk))]
+    code["update_graph_metadata"](
+        target, cu, indices, torch.ones(len(lengths), dtype=torch.bool), heads, skip_single_token=skip_single_token
+    )
+    for table, chunk in (
+        (target.chunk_indices, 64),
+        (target.solve_indices, 1216),
+        (target.cumsum_indices, code["cumsum_block_size"](heads)),
+    ):
+        expected = [
+            (seq, block)
+            for seq, length in enumerate(lengths)
+            if not skip_single_token or length > 1
+            for block in range(math.ceil(length / chunk))
+        ]
         assert table[: len(expected)].tolist() == [list(row) for row in expected]
         assert table[len(expected) :].tolist() == [[64, 0]] * (len(table) - len(expected))
     assert target.query_start_loc[64] == target.query_start_loc[65] == sum(lengths)
-    counts = torch.tensor([math.ceil(length / 64) for length in lengths] + [0] * (65 - len(lengths)))
+    counts = torch.tensor(
+        [math.ceil(length / 64) if not skip_single_token or length > 1 else 0 for length in lengths]
+        + [0] * (65 - len(lengths))
+    )
     torch.testing.assert_close(target.chunk_offsets, torch.cat((torch.tensor([0]), counts.cumsum(0))).int())
 
 
@@ -189,6 +213,40 @@ def test_metadata_update_clears_removed_requests_and_preserves_addresses(graph_c
     assert target.query_start_loc.tolist() == [0, 3, 3, 3, 3, 3]
     assert not target.has_initial_state.any()
     assert addresses == {name: tensor.data_ptr() for name, tensor in vars(target).items()}
+
+
+def test_gdn_refresh_is_one_launch_for_changing_request_counts(graph_code):
+    target = graph_code["allocate_graph_metadata"](768, 64, 16, "cpu")
+    launcher = Mock(wraps=graph_code["_chunk_metadata_kernel"].__getitem__)
+
+    class CountedKernel:
+        def __getitem__(self, grid):
+            return launcher(grid)
+
+    graph_code["_chunk_metadata_kernel"] = CountedKernel()
+    for count in (1, 64, 3, 0):
+        graph_code["update_graph_metadata"](
+            target, torch.arange(count + 1), torch.arange(count), torch.zeros(count, dtype=torch.bool), 16
+        )
+    assert launcher.call_count == 4
+    assert all(call.args == launcher.call_args_list[0].args for call in launcher.call_args_list)
+
+
+def test_gdn_refresh_accepts_strided_single_column_builder_indices(graph_code):
+    target = graph_code["allocate_graph_metadata"](768, 4, 16, "cpu")
+    # Poison gaps in runner views so accidentally treating them as contiguous
+    # changes boundaries/slots/flags rather than passing by coincidence.
+    cu = torch.tensor([0, -99, 63, -99, 128, -99])[::2]
+    indices = torch.tensor([[3, -99], [8, -99]])[:, :1]
+    flags = torch.tensor([True, False, False, True])[::2]
+    graph_code["update_graph_metadata"](target, cu, indices, flags, 16)
+    assert target.query_start_loc.tolist() == [0, 63, 128, 128, 128, 128]
+    assert target.state_read_indices.tolist() == [3, 8, -1, -1, -1]
+    assert target.state_write_indices.tolist() == [3, 8, -1, -1, -1]
+    assert target.has_initial_state.tolist() == [True, False, False, False, False]
+    assert target.chunk_indices[:3].tolist() == [[0, 0], [1, 0], [1, 1]]
+    with pytest.raises(ValueError, match="one cache slot"):
+        graph_code["update_graph_metadata"](target, cu, torch.zeros(2, 2), flags, 16)
 
 
 def test_state_transfer_uses_distinct_anchors_and_never_writes_padding(graph_code):
@@ -232,7 +290,8 @@ def live_context(lengths, *, fresh=False):
     indices = torch.arange(count, dtype=torch.int32) + 1
     flags = torch.full((count,), not fresh)
     num_decodes = 0 if fresh else sum(length == 1 for length in lengths)
-    conv = SimpleNamespace(query_start_loc=cu, cache_indices=indices, initial_state_mode=flags)
+    # The production non-spec builder gives conv1d the (N, 1) block table.
+    conv = SimpleNamespace(query_start_loc=cu, cache_indices=indices[:, None], initial_state_mode=flags)
     gdn = GDNAttentionMetadata(
         num_decodes=num_decodes,
         num_prefills=count - num_decodes,
@@ -267,6 +326,16 @@ def live_context(lengths, *, fresh=False):
 
 @pytest.fixture
 def adapter_code(graph_code):
+    tl = TensorLanguage()
+    attention_code = dict(tl=tl, triton=SimpleNamespace(cdiv=tl.cdiv), METADATA_BLOCK_SIZE=256)
+    load_source(
+        "vllm_ascend/ops/triton/graph_metadata.py",
+        {"_refresh_attention_metadata_kernel", "refresh_attention_metadata"},
+        attention_code,
+    )
+    attention_code["_refresh_attention_metadata_kernel"] = Launch(
+        attention_code["_refresh_attention_metadata_kernel"], tl
+    )
     namespace = dict(
         copy=copy,
         math=math,
@@ -277,6 +346,7 @@ def adapter_code(graph_code):
         FIA_CACHE_BLOCK_SIZE=128,
         allocate_graph_metadata=graph_code["allocate_graph_metadata"],
         update_graph_metadata=graph_code["update_graph_metadata"],
+        refresh_attention_metadata=attention_code["refresh_attention_metadata"],
     )
     return load_source(
         "vllm_ascend/compilation/full_graph_metadata.py",
@@ -285,12 +355,14 @@ def adapter_code(graph_code):
     )
 
 
-def test_adapter_reuses_capacity_across_request_arrivals_lengths_and_classification(adapter_code):
+@pytest.mark.parametrize("seq_dtype", [torch.int32, torch.int64])
+def test_adapter_reuses_capacity_across_request_arrivals_lengths_and_classification(adapter_code, seq_dtype):
     code = adapter_code
     config = SimpleNamespace(
         scheduler_config=SimpleNamespace(max_num_seqs=4), cache_config=SimpleNamespace(block_size=128)
     )
     context = live_context([65, 127], fresh=True)
+    context.attn_metadata["attention"].seq_lens = context.attn_metadata["attention"].seq_lens.to(seq_dtype)
     signature = code["capacity_metadata_signature"](context, config)
     adapter = code["FullGraphMetadataAdapter"](context, signature)
     adapter.update(context.attn_metadata)
@@ -298,15 +370,24 @@ def test_adapter_reuses_capacity_across_request_arrivals_lengths_and_classificat
     addresses = (
         target.block_tables.data_ptr(),
         target.slot_mapping.data_ptr(),
+        target.seq_lens.data_ptr(),
         adapter.metadata["gdn"].query_start_loc.data_ptr(),
     )
     for lengths in ([1, 193], [1, 1, 63, 127], [128], [256]):
         context = live_context(lengths)
+        source = context.attn_metadata["attention"]
+        storage = torch.full((len(lengths), 2), -99, dtype=seq_dtype)
+        storage[:, 0] = source.seq_lens
+        source.seq_lens = storage[:, 0]
         assert code["capacity_metadata_signature"](context, config) == signature
         adapter.update(context.attn_metadata)
         count, actual = len(lengths), sum(lengths)
         assert target.actual_seq_lengths_q == torch.tensor(lengths).cumsum(0).tolist() + [actual] * (4 - count) + [256]
         assert target.seq_lens_list[-1] == 256 - actual
+        expected_lengths = source.seq_lens_list + [0] * (4 - count) + [256 - actual]
+        assert target.seq_lens.tolist() == target.seq_lens_cpu.tolist() == expected_lengths
+        assert target.seq_lens_cpu is target.seq_lens
+        assert target.seq_lens.dtype == seq_dtype
         assert target.attn_state == AttentionState.ChunkedPrefill
         assert target.full_graph_token_capacity == 256
         assert target.num_actual_tokens == actual
@@ -315,8 +396,76 @@ def test_adapter_reuses_capacity_across_request_arrivals_lengths_and_classificat
         assert addresses == (
             target.block_tables.data_ptr(),
             target.slot_mapping.data_ptr(),
+            target.seq_lens.data_ptr(),
             adapter.metadata["gdn"].query_start_loc.data_ptr(),
         )
+
+
+@pytest.mark.parametrize("decode_tokens", [4, 10, 64])
+def test_chunked_prefill_metadata_reuses_graph_buffers_through_decode(adapter_code, decode_tokens):
+    config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_seqs=64), cache_config=SimpleNamespace(block_size=128)
+    )
+    # Logical requests use nonconsecutive cache slots. Requests B and C
+    # arrive while A is still prefilling; the final step reorders live rows.
+    steps = [
+        [(3, 63)],
+        [(3, 64), (8, 1)],
+        [(3, 2), (8, 127), (11, 63)],
+        [(8, 65), (11, 129)],
+        [(11, 3)],
+    ]
+    steps += [[(11, 1), (3, 1), (8, 1)] for _ in range(decode_tokens)]
+    completed = {}
+    adapter, signature = None, None
+    for step in steps:
+        slots, lengths = zip(*step, strict=True)
+        context = live_context(list(lengths))
+        context.batch_descriptor.num_tokens = 768
+        gdn = context.attn_metadata["gdn"].non_spec_prefill_metadata.causal_conv1d
+        flags = torch.tensor([slot in completed for slot in slots])
+        gdn.cache_indices = torch.tensor(slots, dtype=torch.int32)[:, None]
+        gdn.initial_state_mode = flags
+        source = context.attn_metadata["attention"]
+        source.seq_lens_list = [completed.get(slot, 0) + length for slot, length in step]
+        source.seq_lens = torch.tensor(source.seq_lens_list)
+        # Exercise noncontiguous runner tables and slot views too.
+        source.block_tables = torch.arange(len(slots) * 8, dtype=torch.int32).reshape(len(slots), 8)[:, ::2]
+        source.slot_mapping = torch.arange(sum(lengths) * 2)[::2]
+        current = adapter_code["capacity_metadata_signature"](context, config)
+        if adapter is None:
+            signature = current
+            adapter = adapter_code["FullGraphMetadataAdapter"](context, signature)
+            addresses = {name: tensor.data_ptr() for name, tensor in vars(adapter.metadata["gdn"]).items()}
+        assert current == signature
+        adapter.update(context.attn_metadata)
+        target = adapter.metadata["gdn"]
+        n = len(slots)
+        assert target.has_initial_state[:n].tolist() == flags.tolist()
+        assert target.state_read_indices[:n].tolist() == list(slots)
+        assert target.state_write_indices[:n].tolist() == list(slots)
+        assert target.state_write_indices[n:].eq(-1).all()
+        expected_chunks = [
+            [row, chunk] for row, length in enumerate(lengths) if length > 1 for chunk in range(math.ceil(length / 64))
+        ]
+        assert target.chunk_indices[: len(expected_chunks)].tolist() == expected_chunks
+        assert target.chunk_indices[len(expected_chunks) :].tolist() == [[64, 0]] * (
+            len(target.chunk_indices) - len(expected_chunks)
+        )
+        assert addresses == {name: tensor.data_ptr() for name, tensor in vars(target).items()}
+        attention = adapter.metadata["attention"]
+        torch.testing.assert_close(attention.block_tables[:n, :4], source.block_tables)
+        assert not attention.block_tables[n:].any()
+        assert not attention.block_tables[:n, 4:].any()
+        torch.testing.assert_close(attention.slot_mapping[: sum(lengths)], source.slot_mapping)
+        assert attention.slot_mapping[sum(lengths) :].eq(-1).all()
+        assert attention.query_start_loc.tolist() == [0, *torch.tensor(lengths).cumsum(0).tolist()] + [sum(lengths)] * (
+            64 - n
+        ) + [768]
+        assert attention.seq_lens_list[:n] == source.seq_lens_list
+        assert attention.seq_lens.tolist() == source.seq_lens_list + [0] * (64 - n) + [768 - sum(lengths)]
+        for slot, length in step:
+            completed[slot] = completed.get(slot, 0) + length
 
 
 @dataclass(frozen=True)
@@ -475,29 +624,135 @@ def test_cumsum_stores_destination_dtype_for_bf16_input(graph_code, output_dtype
     assert output[:, total:].isnan().all()
 
 
-def test_triton_state_and_output_stages_match_recurrence_with_nan_padding(graph_code):
+@pytest.mark.parametrize("steps", [4, 10, 64])
+@pytest.mark.parametrize("cache_dtype", [torch.float32, torch.bfloat16])
+def test_single_token_recurrence_survives_reordering_and_slot_reuse(graph_code, steps, cache_dtype):
+    torch.manual_seed(19)
+    capacity, heads, key_heads, dim = 160, 4, 2, 128
+    metadata = graph_code["allocate_graph_metadata"](capacity, 4, heads, "cpu")
+    addresses = {name: value.data_ptr() for name, value in vars(metadata).items()}
+    # Exercise noncontiguous cache layout and grouped query/key heads.
+    cache = (torch.randn(8, heads, dim, dim) * 0.05).to(cache_dtype).transpose(-1, -2)
+    expected_cache = cache.clone()
+    slots = [1, 4, 2, 5]
+    for step in range(steps):
+        fresh = set()
+        if step == 2:
+            slots[0] = 6  # A completed decode is replaced by a fresh request.
+            fresh.add(0)
+        elif step == 3:
+            slots[1] = 1  # Reuse the first request's former cache slot.
+            fresh.add(1)
+        for request in fresh:
+            cache[slots[request]] = expected_cache[slots[request]] = float("nan")
+        before = cache.clone()
+        # A prefill enters/leaves the batch, and packed row order changes.
+        order = [2, 1, 3, 0] if step % 2 else [0, 1, 2]
+        lengths = [1 if request < 2 else (63 if request == 2 else 65) for request in order]
+        boundaries = [0, *torch.tensor(lengths).cumsum(0).tolist()]
+        graph_code["update_graph_metadata"](
+            metadata,
+            torch.tensor(boundaries),
+            torch.tensor([slots[request] for request in order])[:, None],
+            torch.tensor([request not in fresh for request in order]),
+            heads,
+            skip_single_token=True,
+        )
+        q = torch.nn.functional.normalize(torch.randn(1, capacity, key_heads, dim), dim=-1).bfloat16()
+        k = torch.nn.functional.normalize(torch.randn_like(q.float()), dim=-1).bfloat16()
+        v = torch.randn(1, capacity, heads, dim).bfloat16()
+        # Gates and beta may be strided views of fused projection results.
+        g = (-torch.rand(1, capacity, heads * 2) * 0.05)[..., ::2]
+        beta = torch.rand(1, capacity, heads * 2)[..., 1::2]
+        output = torch.full_like(v, float("nan"))
+        expected_output = torch.full_like(v, float("nan"))
+        step_reference = before.clone()
+        for row, request in enumerate(order):
+            if lengths[row] != 1:
+                continue
+            token, slot = boundaries[row], slots[request]
+            qt = q[0, token].float().repeat_interleave(heads // key_heads, dim=0)
+            kt = k[0, token].float().repeat_interleave(heads // key_heads, dim=0)
+            for reference in (step_reference, expected_cache):
+                state = reference[slot].float().clone()
+                if request in fresh:
+                    state.zero_()
+                # Independent recurrence uses cache orientation [head, value, key].
+                state *= g[0, token].exp()[:, None, None]
+                prediction = torch.einsum("hvk,hk->hv", state, kt)
+                delta = beta[0, token, :, None] * (v[0, token].float() - prediction)
+                state += delta[:, :, None] * kt[:, None, :]
+                expected_output[0, token] = torch.einsum("hvk,hk->hv", state, qt) / math.sqrt(dim)
+                reference[slot] = state.to(cache_dtype)
+        graph_code["single_token_gdn"](q, k, v, g, beta, cache, metadata, output)
+        torch.testing.assert_close(output, expected_output, atol=0.001, rtol=0.01, equal_nan=True)
+        # Check each update against the same incoming state. BF16 persistence
+        # allows one rounding unit for different FP32 reduction orders.
+        state_rtol = torch.finfo(cache_dtype).eps if cache_dtype == torch.bfloat16 else 1e-5
+        torch.testing.assert_close(cache, step_reference, atol=1e-6, rtol=state_rtol, equal_nan=True)
+        # Also bound trajectory drift from an independently evolving cache.
+        # Near-zero elements make an elementwise relative bound unsuitable
+        # after repeated BF16 rounding; use relative RMS for the state vector.
+        active = cache[[slots[0], slots[1]]].float()
+        expected_active = expected_cache[[slots[0], slots[1]]].float()
+        relative_rms = (active - expected_active).square().mean().sqrt() / expected_active.square().mean().sqrt()
+        assert relative_rms < (torch.finfo(torch.bfloat16).eps if cache_dtype == torch.bfloat16 else 1e-5)
+        untouched = torch.ones(cache.shape[0], dtype=torch.bool)
+        untouched[[slots[0], slots[1]]] = False
+        torch.testing.assert_close(cache[untouched], before[untouched], atol=0, rtol=0, equal_nan=True)
+        assert addresses == {name: value.data_ptr() for name, value in vars(metadata).items()}
+
+
+@pytest.mark.parametrize("requests", [2, 3, 4, 8, 16, 32, 64])
+@pytest.mark.parametrize("cache_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("split_single_token", [False, True])
+def test_triton_state_and_output_stages_match_recurrence_with_nan_padding(
+    graph_code, requests, cache_dtype, split_single_token
+):
     torch.manual_seed(7)
-    lengths, capacity, heads, key_heads, dim = [1, 63, 65], 160, 2, 1, 128
+    # Many decodes coexist with a continuing partial prefill and a fresh
+    # prefill. At concurrency two, use one decode and one fresh prefill.
+    lengths = [1, 65] if requests == 2 else [1] * (requests - 2) + [63, 65]
+    heads, key_heads, dim = 2, 1, 128
     total = sum(lengths)
-    meta = graph_code["allocate_graph_metadata"](capacity, 4, heads, "cpu")
+    capacity = math.ceil((total + 1) / 64) * 64
+    meta = graph_code["allocate_graph_metadata"](capacity, requests, heads, "cpu")
+    slots = torch.randperm(requests + 1)[:requests]
+    flags = torch.ones(requests, dtype=torch.bool)
+    flags[-1] = False
+    if requests >= 4:
+        flags[0] = False  # A newly arrived one-token request also uses the fast path.
     graph_code["update_graph_metadata"](
-        meta, torch.tensor([0, 1, 64, total]), torch.tensor([0, 1, 2]), torch.ones(3, dtype=torch.bool), heads
+        meta,
+        torch.tensor([0, *torch.tensor(lengths).cumsum(0).tolist()]),
+        slots[:, None],
+        flags,
+        heads,
+        skip_single_token=split_single_token,
     )
     q = torch.nn.functional.normalize(torch.randn(1, capacity, key_heads, dim), dim=-1).bfloat16()
     k = torch.nn.functional.normalize(torch.randn_like(q.float()), dim=-1).bfloat16()
     v = torch.randn(1, capacity, heads, dim).bfloat16()
     g = -torch.rand(1, capacity, heads) * 0.05
     beta = torch.rand(1, capacity, heads)
-    initial = torch.randn(5, heads, dim, dim) * 0.05
-    initial[3:] = float("nan")
+    cache = (torch.randn(requests + 3, heads, dim, dim) * 0.05).to(cache_dtype)
+    cache[slots[~flags]] = float("nan")
+    before = cache.clone()
+    initial = torch.full((requests + 1, heads, dim, dim), float("nan"), dtype=cache_dtype)
+    graph_code["transfer_state"](cache, initial, meta, write=False, skip_single_token=split_single_token)
+    expected_initial = torch.where(flags[:, None, None, None], before[slots].transpose(-1, -2), 0)
+    chunk_rows = torch.tensor([not split_single_token or length > 1 for length in lengths])
+    torch.testing.assert_close(initial[:requests][chunk_rows], expected_initial[chunk_rows])
+    if split_single_token:
+        assert initial[:requests][~chunk_rows].isnan().all()
     w = torch.full((1, capacity, heads, dim), float("nan"), dtype=k.dtype)
     u = torch.full_like(v, float("nan"))
     cumulative_g = torch.full_like(g, float("nan"))
     expected_output = torch.empty(1, total, heads, dim)
-    expected_state = initial.clone()
+    expected_state = expected_initial.float().clone()
     start = 0
     for seq, length in enumerate(lengths):
-        state = initial[seq].clone()
+        state = expected_initial[seq].float().clone()
         for token in range(start, start + length):
             kt = k[0, token, 0].float().expand(heads, -1)
             state *= g[0, token].exp()[:, None, None]
@@ -519,6 +774,9 @@ def test_triton_state_and_output_stages_match_recurrence_with_nan_padding(graph_
         start += length
     q[:, total:] = k[:, total:] = float("nan")
     v[:, total:] = float("nan")
+    output = torch.full_like(v, float("nan"))
+    if split_single_token:
+        graph_code["single_token_gdn"](q, k, v, g, beta, cache, meta, output)
     tl = TensorLanguage()
     namespace = dict(tl=tl, safe_exp=lambda x: torch.where(x <= 0, x, -float("inf")).exp())
     load_source(
@@ -526,7 +784,7 @@ def test_triton_state_and_output_stages_match_recurrence_with_nan_padding(graph_
     )
     load_source("vllm_ascend/ops/triton/fla/chunk_o.py", {"chunk_fwd_kernel_o"}, namespace)
     h = torch.full((1, len(meta.chunk_indices), heads, dim, dim), float("nan"), dtype=k.dtype)
-    final = torch.full_like(initial, float("nan"))
+    final = torch.full_like(initial, float("nan"), dtype=torch.float32)
     v_new = torch.full_like(v, float("nan"))
     common = dict(
         cu_seqlens=meta.query_start_loc,
@@ -539,8 +797,9 @@ def test_triton_state_and_output_stages_match_recurrence_with_nan_padding(graph_
         BT=64,
         USE_G=True,
         IS_VARLEN=True,
+        SKIP_SINGLE_TOKEN=split_single_token,
     )
-    Launch(namespace["chunk_gated_delta_rule_fwd_kernel_h_blockdim64"], tl)[(1, 5 * heads)](
+    Launch(namespace["chunk_gated_delta_rule_fwd_kernel_h_blockdim64"], tl)[(1, (requests + 1) * heads)](
         k=k,
         v=u,
         w=w,
@@ -555,8 +814,7 @@ def test_triton_state_and_output_stages_match_recurrence_with_nan_padding(graph_
         SAVE_NEW_VALUE=True,
         **common,
     )
-    output = torch.full_like(v, float("nan"))
-    Launch(namespace["chunk_fwd_kernel_o"], tl)[(1, 5 * heads)](
+    Launch(namespace["chunk_fwd_kernel_o"], tl)[(1, (requests + 1) * heads)](
         q=q,
         k=k,
         v=v_new,
@@ -568,6 +826,13 @@ def test_triton_state_and_output_stages_match_recurrence_with_nan_padding(graph_
         BV=128,
         **common,
     )
-    torch.testing.assert_close(final[:3], expected_state[:3], atol=0.025, rtol=0.025)
+    torch.testing.assert_close(final[:requests][chunk_rows], expected_state[chunk_rows], atol=0.025, rtol=0.025)
     torch.testing.assert_close(output[:, :total].float(), expected_output, atol=0.01, rtol=0.025)
-    assert output[:, total:].isnan().all() and final[3:].isnan().all()
+    assert output[:, total:].isnan().all() and final[requests:].isnan().all()
+    if split_single_token:
+        assert final[:requests][~chunk_rows].isnan().all()
+    graph_code["transfer_state"](cache, final, meta, write=True, skip_single_token=split_single_token)
+    torch.testing.assert_close(cache[slots].float(), expected_state.transpose(-1, -2), atol=0.025, rtol=0.025)
+    inactive = torch.ones(cache.shape[0], dtype=torch.bool)
+    inactive[slots] = False
+    torch.testing.assert_close(cache[inactive], before[inactive], atol=0, rtol=0)

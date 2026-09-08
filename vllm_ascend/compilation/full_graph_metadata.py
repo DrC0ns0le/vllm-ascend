@@ -8,6 +8,7 @@ import torch
 
 from vllm_ascend.ops.gdn_graph_metadata import GDN_GRAPH_HEAD_DIM, MAX_GDN_GRAPH_HEADS
 from vllm_ascend.ops.triton.fla.graph import allocate_graph_metadata, update_graph_metadata
+from vllm_ascend.ops.triton.graph_metadata import refresh_attention_metadata
 
 MAX_GRAPH_REQUESTS = 64
 FIA_CACHE_BLOCK_SIZE = 128
@@ -45,7 +46,9 @@ def capacity_metadata_signature(context, config):
             conv = metadata.non_spec_prefill_metadata.causal_conv1d
             if conv.query_start_loc.shape != (count + 1,) or conv.initial_state_mode is None:
                 return None
-            if conv.initial_state_mode.shape != (count,) or conv.cache_indices.shape != (count,):
+            # Cache-mode none's builder passes the single-column block
+            # table to conv1d, while recurrent metadata uses a vector view.
+            if conv.initial_state_mode.shape != (count,) or conv.cache_indices.shape not in ((count,), (count, 1)):
                 return None
             result.append((name, "gdn", aliases[id(metadata)], states[1].shape[1]))
         else:
@@ -105,7 +108,14 @@ class FullGraphMetadataAdapter:
                 target.block_tables = source.block_tables.new_zeros((rows, spec[3]))
                 target.slot_mapping = source.slot_mapping.new_full((self.tokens,), -1)
                 target.seq_lens = source.seq_lens.new_zeros(rows)
-                target.seq_lens_cpu = torch.zeros(rows, dtype=source.seq_lens.dtype)
+                # The standard Ascend builder supplies host sequence lengths.
+                # Share their graph-owned buffer instead of constructing and
+                # copying a second CPU tensor on every metadata refresh.
+                target.seq_lens_cpu = (
+                    target.seq_lens
+                    if target.seq_lens.device.type == "cpu"
+                    else torch.zeros(rows, dtype=source.seq_lens.dtype)
+                )
                 target.query_start_loc = source.query_start_loc.new_zeros(rows + 1)
                 target.seq_lens_list = [0] * rows
                 target.actual_seq_lengths_q = [0] * rows
@@ -124,7 +134,12 @@ class FullGraphMetadataAdapter:
             if name in self.heads:
                 conv = source.non_spec_prefill_metadata.causal_conv1d
                 update_graph_metadata(
-                    target, conv.query_start_loc, conv.cache_indices, conv.initial_state_mode, self.heads[name]
+                    target,
+                    conv.query_start_loc,
+                    conv.cache_indices,
+                    conv.initial_state_mode,
+                    self.heads[name],
+                    skip_single_token=True,
                 )
                 continue
             actual = source.num_actual_tokens
@@ -139,14 +154,9 @@ class FullGraphMetadataAdapter:
             target.seq_lens.zero_()
             target.seq_lens[:count].copy_(source.seq_lens[:count])
             target.seq_lens[-1:].fill_(padding)
-            target.seq_lens_cpu.copy_(torch.tensor(target.seq_lens_list, dtype=target.seq_lens_cpu.dtype))
-            target.query_start_loc.copy_(source.query_start_loc[count : count + 1].expand_as(target.query_start_loc))
-            target.query_start_loc[: count + 1].copy_(source.query_start_loc[: count + 1])
-            target.query_start_loc[-1:].fill_(self.tokens)
-            target.slot_mapping.fill_(-1)
-            target.slot_mapping[:actual].copy_(source.slot_mapping[:actual])
-            target.block_tables.zero_()
-            target.block_tables[:count, : source.block_tables.shape[1]].copy_(source.block_tables[:count])
+            if target.seq_lens_cpu is not target.seq_lens:
+                target.seq_lens_cpu.copy_(torch.tensor(target.seq_lens_list, dtype=target.seq_lens_cpu.dtype))
+            refresh_attention_metadata(target, source, count, actual)
             # Dummy queries read valid allocated block 0, possibly repeated;
             # their outputs are discarded and their KV slots are all -1.
             if target.attn_mask is not None:

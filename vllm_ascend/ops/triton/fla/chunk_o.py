@@ -43,6 +43,7 @@ def chunk_fwd_kernel_o(
     BV: tl.constexpr,
     USE_G: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    SKIP_SINGLE_TOKEN: tl.constexpr = False,
 ):
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_h = i_nh // H, i_nh % H
@@ -51,6 +52,8 @@ def chunk_fwd_kernel_o(
     if IS_VARLEN:
         bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
         T = eos - bos
+        if SKIP_SINGLE_TOKEN and T == 1:
+            return
         NT = tl.cdiv(T, BT)
         boh = tl.load(chunk_offsets + i_n).to(tl.int64)
     else:
@@ -120,6 +123,7 @@ def chunk_fwd_o(
     chunk_size: int = 64,
     chunk_offsets: torch.Tensor | None = None,
     output: torch.Tensor | None = None,
+    skip_single_token: bool = False,
 ) -> torch.Tensor:
     B, T, Hg, K, V = *q.shape, v.shape[-1]
     H = v.shape[-2]
@@ -158,6 +162,7 @@ def chunk_fwd_o(
         BT=BT,
         BK=128,
         BV=128,
+        SKIP_SINGLE_TOKEN=skip_single_token,
         num_warps=4,
         num_stages=2,
     )
