@@ -15,9 +15,6 @@ from vllm.triton_utils import tl, triton
 from .utils import prepare_chunk_indices, prepare_chunk_offsets, safe_exp
 
 _CONDITIONS = ("seq7168",)
-# One FP32 [128, 32] accumulator: 16 KiB before compiler temporaries,
-# instead of the two [128, 64] accumulators in the staged-state route.
-DIRECT_STATE_VALUE_TILE = 32
 
 
 @triton.heuristics(
@@ -53,30 +50,17 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     STORE_FINAL_STATE: tl.constexpr,
     SAVE_NEW_VALUE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
-    SKIP_SINGLE_TOKEN: tl.constexpr = False,
-    state_read_indices=None,
-    state_write_indices=None,
-    state_initial_flags=None,
-    DIRECT_STATE: tl.constexpr = False,
-    STATE_N: tl.constexpr = 0,
-    STATE_H: tl.constexpr = 0,
-    STATE_V: tl.constexpr = 0,
-    STATE_K: tl.constexpr = 0,
-    G_TOKEN_STRIDE: tl.constexpr = 1,
-    G_HEAD_STRIDE: tl.constexpr = 0,
-    BV: tl.constexpr = 64,
 ):
     i_nh = tl.program_id(1)
     i_n, i_h = i_nh // H, i_nh % H
     T_max = 1 * T
-    g_head_stride = G_HEAD_STRIDE if G_HEAD_STRIDE else T_max
     if IS_VARLEN:
         bos, eos = (
             tl.load(cu_seqlens + i_n).to(tl.int32),
             tl.load(cu_seqlens + i_n + 1).to(tl.int32),
         )
         T = eos - bos
-        if T <= 0 or (SKIP_SINGLE_TOKEN and T == 1):
+        if T <= 0:
             return
         NT = tl.cdiv(T, BT)
         boh = tl.load(chunk_offsets + i_n).to(tl.int32)
@@ -89,36 +73,21 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     stride_k = Hg * K
     stride_w = H * K
 
-    if DIRECT_STATE:
-        read = tl.load(state_read_indices + i_n)
-        write = tl.load(state_write_indices + i_n)
-        if (read < 0) | (write < 0):
-            return
+    b_h1_bv1 = tl.zeros([128, 64], dtype=tl.float32)
+    b_h1_bv2 = tl.zeros([128, 64], dtype=tl.float32)
+    # create b_hupd_bv1 and b_hupd_bv2
 
-    b_h1_bv1 = tl.zeros([128, BV], dtype=tl.float32)
-    v_start1 = tl.program_id(0) * BV if DIRECT_STATE else 0
+    v_start1 = 0
+    v_start2 = 64
 
     offs_k = tl.arange(0, 128)[:, None]
-    offs_v1 = v_start1 + tl.arange(0, BV)[None, :]
+    offs_v1 = v_start1 + tl.arange(0, 64)[None, :]
+    offs_v2 = v_start2 + tl.arange(0, 64)[None, :]
     mask_kv1 = (offs_k < K) & (offs_v1 < V)
-    if not DIRECT_STATE:
-        b_h1_bv2 = tl.zeros([128, 64], dtype=tl.float32)
-        v_start2 = 64
-        offs_v2 = v_start2 + tl.arange(0, 64)[None, :]
-        mask_kv2 = (offs_k < K) & (offs_v2 < V)
+    mask_kv2 = (offs_k < K) & (offs_v2 < V)
 
     # load initial state
-    if DIRECT_STATE:
-        initial = tl.load(state_initial_flags + i_n) != 0
-        h0_ptr = h0 + read * STATE_N + i_h * STATE_H
-        # Cache layout is [slot, head, value, key]. Read the transpose
-        # directly into the recurrence's [key, value] accumulators.
-        # Fresh requests must suppress the cache read itself: selecting zero
-        # after an unmasked load produced incorrect results on Ascend.
-        b_h1_bv1 += tl.load(h0_ptr + offs_k * STATE_K + offs_v1 * STATE_V, mask=mask_kv1 & initial, other=0.0).to(
-            tl.float32
-        )
-    elif USE_INITIAL_STATE:
+    if USE_INITIAL_STATE:
         h0_ptr = h0 + i_nh * K * V
         ptr_h0_bv1 = h0_ptr + offs_k * V + offs_v1 * 1
         b_h1_bv1 += tl.load(ptr_h0_bv1, mask=mask_kv1, other=0.0).to(tl.float32)
@@ -130,12 +99,11 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     for i_t in range(NT):
         h_base = h + (boh + i_t) * H * K * V + i_h * K * V
 
-        p_h1_bv1 = tl.make_block_ptr(h_base, (K, V), (V, 1), (0, v_start1), (128, BV), (1, 0))
+        p_h1_bv1 = tl.make_block_ptr(h_base, (K, V), (V, 1), (0, v_start1), (128, 64), (1, 0))
         tl.store(p_h1_bv1, b_h1_bv1.to(p_h1_bv1.dtype.element_ty), boundary_check=(0, 1))
 
-        if not DIRECT_STATE:
-            p_h1_bv2 = tl.make_block_ptr(h_base, (K, V), (V, 1), (0, v_start2), (128, 64), (1, 0))
-            tl.store(p_h1_bv2, b_h1_bv2.to(p_h1_bv2.dtype.element_ty), boundary_check=(0, 1))
+        p_h1_bv2 = tl.make_block_ptr(h_base, (K, V), (V, 1), (0, v_start2), (128, 64), (1, 0))
+        tl.store(p_h1_bv2, b_h1_bv2.to(p_h1_bv2.dtype.element_ty), boundary_check=(0, 1))
 
         offs_t_wv = (i_t * BT + tl.arange(0, BT))[:, None]
         offs_k_wv = tl.arange(0, 128)[None, :]
@@ -152,12 +120,12 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
         v_new_base = v_new + bos * H * V + i_h * V
 
         last_idx = min((i_t + 1) * BT, T) - 1
-        b_g_last = tl.load(g + (bos + last_idx) * G_TOKEN_STRIDE + i_h * g_head_stride)
+        b_g_last = tl.load(g + bos + i_h * T_max + last_idx)
 
         offs_t = i_t * BT + tl.arange(0, BT)
         mask_t = offs_t < T
-        g_ptr = g + bos * G_TOKEN_STRIDE + i_h * g_head_stride
-        b_g = tl.load(g_ptr + offs_t * G_TOKEN_STRIDE, mask=mask_t, other=0.0)
+        g_ptr = g + bos + i_h * T_max
+        b_g = tl.load(g_ptr + offs_t, mask=mask_t, other=0.0)
 
         b_g = safe_exp(b_g_last - b_g)
         b_g_last = tl.exp(b_g_last)
@@ -172,7 +140,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
         b_v_new1 -= tl.dot(b_w, b_h1_bv1.to(b_w.dtype))
 
         if SAVE_NEW_VALUE:
-            p_v_new1 = tl.make_block_ptr(v_new_base, (T, V), (stride_v, 1), (i_t * BT, v_start1), (BT, BV), (1, 0))
+            p_v_new1 = tl.make_block_ptr(v_new_base, (T, V), (stride_v, 1), (i_t * BT, v_start1), (BT, 64), (1, 0))
             tl.store(p_v_new1, b_v_new1.to(p_v_new1.dtype.element_ty), boundary_check=(0, 1))
 
         if USE_G:
@@ -182,31 +150,25 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
         b_v_new1 = b_v_new1.to(k.dtype.element_ty)
         b_h1_bv1 += tl.dot(b_k, b_v_new1)
 
-        if not DIRECT_STATE:
-            mask_v2 = (offs_t_v < T) & (offs_v2 < V)
-            ptr_v2 = v_base + offs_t_v * stride_v + offs_v2 * 1
-            b_v2 = tl.load(ptr_v2, mask=mask_v2, other=0.0)
-            b_v_new2 = b_v2.to(tl.float32)
-            b_v_new2 -= tl.dot(b_w, b_h1_bv2.to(b_w.dtype))
+        mask_v2 = (offs_t_v < T) & (offs_v2 < V)
+        ptr_v2 = v_base + offs_t_v * stride_v + offs_v2 * 1
+        b_v2 = tl.load(ptr_v2, mask=mask_v2, other=0.0)
+        b_v_new2 = b_v2.to(tl.float32)
+        b_v_new2 -= tl.dot(b_w, b_h1_bv2.to(b_w.dtype))
 
-            if SAVE_NEW_VALUE:
-                p_v_new2 = tl.make_block_ptr(v_new_base, (T, V), (stride_v, 1), (i_t * BT, v_start2), (BT, 64), (1, 0))
-                tl.store(p_v_new2, b_v_new2.to(p_v_new2.dtype.element_ty), boundary_check=(0, 1))
+        if SAVE_NEW_VALUE:
+            p_v_new2 = tl.make_block_ptr(v_new_base, (T, V), (stride_v, 1), (i_t * BT, v_start2), (BT, 64), (1, 0))
+            tl.store(p_v_new2, b_v_new2.to(p_v_new2.dtype.element_ty), boundary_check=(0, 1))
 
-            if USE_G:
-                b_v_new2 = b_v_new2 * b_g[:, None]
-                b_h1_bv2 = b_h1_bv2 * b_g_last
+        if USE_G:
+            b_v_new2 = b_v_new2 * b_g[:, None]
+            b_h1_bv2 = b_h1_bv2 * b_g_last
 
-            b_v_new2 = b_v_new2.to(k.dtype.element_ty)
-            b_h1_bv2 += tl.dot(b_k, b_v_new2)
+        b_v_new2 = b_v_new2.to(k.dtype.element_ty)
+        b_h1_bv2 += tl.dot(b_k, b_v_new2)
 
     # epilogue
-    if DIRECT_STATE:
-        ht_ptr = ht + write * STATE_N + i_h * STATE_H
-        # Each live request owns disjoint cache rows. Single-token rows
-        # have already returned and are updated by single_token_gdn.
-        tl.store(ht_ptr + offs_k * STATE_K + offs_v1 * STATE_V, b_h1_bv1, mask_kv1)
-    elif STORE_FINAL_STATE:
+    if STORE_FINAL_STATE:
         ht_ptr = ht + i_nh * K * V
 
         p_ht1_bv1 = tl.make_block_ptr(ht_ptr, (K, V), (V, 1), (0, v_start1), (128, 64), (1, 0))
@@ -228,10 +190,6 @@ def chunk_gated_delta_rule_fwd_h(
     cu_seqlens: torch.LongTensor | None = None,
     chunk_indices: torch.Tensor | None = None,
     chunk_offsets: torch.Tensor | None = None,
-    skip_single_token: bool = False,
-    state_cache: torch.Tensor | None = None,
-    state_metadata=None,
-    token_major_g: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # This kernel is slightly different from fla to support Q/K with different head numbers.
     # In fla, Q/K always have the same head number, so Hg is always equal to H.
@@ -255,26 +213,13 @@ def chunk_gated_delta_rule_fwd_h(
     assert K <= 256, "current kernel does not support head dimension larger than 256."
 
     h = k.new_empty(B, NT, H, K, V)
-    direct_state = state_cache is not None
-    if direct_state:
-        if state_metadata is None or initial_state is not None or not output_final_state or cu_seqlens is None:
-            raise ValueError("Direct GDN state requires device metadata, variable lengths, and final-state writeback")
-        if state_cache.ndim != 4 or state_cache.shape[1:] != (H, V, K):
-            raise ValueError("Direct GDN state requires [slot, head, value, key] cache layout")
-        final_state = state_cache
-    else:
-        final_state = k.new_empty(N, H, K, V, dtype=torch.float32) if output_final_state else None
+    final_state = k.new_empty(N, H, K, V, dtype=torch.float32) if output_final_state else None
 
     v_new = torch.empty_like(u) if save_new_value else None
-    if not token_major_g:
-        g = g.transpose(1, 2).contiguous()
+    g = g.transpose(1, 2).contiguous()
 
     def grid(meta):
-        return (triton.cdiv(V, DIRECT_STATE_VALUE_TILE) if direct_state else 1, N * H)
-
-    # The direct route keeps one small state tile live and disables Ascend
-    # ping-pong buffers. num_stages alone does not control that duplication.
-    compile_options = {"multibuffer": False} if direct_state else {}
+        return (1, N * H)
 
     chunk_gated_delta_rule_fwd_kernel_h_blockdim64[grid](
         k=k,
@@ -283,7 +228,7 @@ def chunk_gated_delta_rule_fwd_h(
         v_new=v_new,
         g=g,
         h=h,
-        h0=state_cache if direct_state else initial_state,
+        h0=initial_state,
         ht=final_state,
         cu_seqlens=cu_seqlens,
         chunk_offsets=chunk_offsets,
@@ -294,20 +239,7 @@ def chunk_gated_delta_rule_fwd_h(
         K=K,
         V=V,
         BT=BT,
-        SKIP_SINGLE_TOKEN=skip_single_token,
-        state_read_indices=state_metadata.state_read_indices if direct_state else None,
-        state_write_indices=state_metadata.state_write_indices if direct_state else None,
-        state_initial_flags=state_metadata.has_initial_state if direct_state else None,
-        DIRECT_STATE=direct_state,
-        STATE_N=state_cache.stride(0) if direct_state else 0,
-        STATE_H=state_cache.stride(1) if direct_state else 0,
-        STATE_V=state_cache.stride(2) if direct_state else 0,
-        STATE_K=state_cache.stride(3) if direct_state else 0,
-        G_TOKEN_STRIDE=g.stride(1) if token_major_g else 1,
-        G_HEAD_STRIDE=g.stride(2) if token_major_g else 0,
-        BV=DIRECT_STATE_VALUE_TILE if direct_state else 64,
         num_warps=4,
-        num_stages=1 if direct_state else 2,
-        **compile_options,
+        num_stages=2,
     )
     return h, v_new, final_state

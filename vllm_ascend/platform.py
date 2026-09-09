@@ -466,6 +466,9 @@ class NPUPlatform(Platform):
 
         from vllm.config.compilation import CUDAGraphMode
 
+        # Defer config-dependent helpers until platform initialization finishes.
+        from vllm_ascend.compilation.piecewise_graph import configure_gdn_piecewise_graphs
+
         if ascend_config.xlite_graph_config.enabled:
             if ascend_config.xlite_graph_config.full_mode and vllm_config.speculative_config is None:
                 logger.info("ACLGraph has been disabled when speculation is disabled in xlite full mode")
@@ -496,6 +499,7 @@ class NPUPlatform(Platform):
         # `apply_config_platform_defaults`, so this late pass should only honor
         # the current max / size inputs after the mode adjustments above.
         vllm_config._set_cudagraph_sizes()
+        configure_gdn_piecewise_graphs(vllm_config)
         # TODO delete graph size update here when compilation_config.pass_config.enable_sp
         # is supported by vllm-ascend.
         if (

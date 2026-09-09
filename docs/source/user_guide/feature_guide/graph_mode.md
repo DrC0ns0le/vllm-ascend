@@ -265,173 +265,53 @@ vllm serve path/to/Qwen3-32B \
 
 For more details about Xlite, see the [Xlite README](https://atomgit.com/openeuler/GVirt/blob/master/xlite/README.md).
 
-## Qwen3.5 FULL Prefill and Mixed Capture
+## Qwen3.5 native kernels with piecewise token buckets
 
-On Ascend 910B, the MRV1 breakable ACLGraph wrapper can capture fresh prefill,
-continuation prefill, and mixed prefill/decode batches, including the baseline
-GDN core, as one graph with no eager breaks. New requests can therefore join
-ongoing requests through the existing scheduler. MegaGDN remains on the
-PIECEWISE path. Decode continues
-using its existing FULL graph path. Hardware correctness and performance
-validation of this prefill path is still required.
-
-This path requires TP/PP/DP/PCP/DCP size 1, `mamba_cache_mode="none"`, and no
-speculative decoding, LoRA, KV transfer, C8 attention, attention sinks, or ENPU.
-Use `FULL` for execution without PIECEWISE/eager fallback. The runner pads
-each scheduled batch to the next token capacity and captures all retained
-capacities at startup. It adds `max_num_batched_tokens` as the final ceiling,
-so coverage does not end at the last configured capture size. Standard FULL
-decode captures remain separate and cover every request count up to
-`max_num_seqs`.
-
-For example:
+Use MRV1 breakable graphs with `FULL_AND_PIECEWISE` to retain native Ascend
+attention and GDN operators for fresh, continuation, chunked, and mixed prefill.
+Projection, normalization, and MLP regions replay captured graphs. The operator
+breaks read the current request boundaries and state slots on every replay.
+Uniform decode keeps its standard FULL graph path.
 
 ```bash
-VLLM_USE_BREAKABLE_CUDAGRAPH=1 vllm serve /path/to/Qwen3.5-2B \
+VLLM_USE_V2_MODEL_RUNNER=0 VLLM_USE_BREAKABLE_CUDAGRAPH=1 \
+vllm serve Qwen/Qwen3.5-2B \
+  --dtype bfloat16 \
+  --tensor-parallel-size 1 \
+  --max-model-len 768 \
   --max-num-seqs 64 \
-  --max-model-len 1536 \
   --max-num-batched-tokens 4096 \
-  --compilation-config '{"cudagraph_mode":"FULL","cudagraph_capture_sizes":[1,64,128,196,256,384,512,768,1024,1536,2048,3172,4096]}'
+  --enable-chunked-prefill \
+  --no-enable-prefix-caching \
+  --mamba-cache-mode none \
+  --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","cudagraph_capture_sizes":[1,64,128,196,256,384,512,768,1024,1536,2048,3172,4096]}'
 ```
 
-Capacities describe aggregate scheduled tokens, not individual prompt lengths.
-Two decodes plus 137-token and 220-token prefills total 359 tokens and use a
-384-token capture. The 25 padding tokens cannot write KV or recurrent state.
-Larger arrivals are handled by the existing scheduler and chunked prefill;
-no extra batching layer is introduced.
+For breakable GDN models, a request for `FULL` now resolves to
+`FULL_AND_PIECEWISE` with a warning. The experimental native FULL-prefill cache,
+device attention kernel, and fused GDN state/output route have been removed.
+The old `full_prefill_graph_max_entries` setting has no effect. Leave
+`VLLM_ASCEND_PTO_CHUNK_GDN` disabled (its default) to use the baseline AscendC
+GDN pipeline; MegaGDN remains a separate explicit opt-in.
 
-Startup warmup uses distinct recurrent slots, restores their state afterward,
-and captures both token-ID and embedding inputs when applicable. Captures must
-contain exactly one graph with no eager breaks. Serving then only replays:
-an unsupported configuration or an uncaptured input signature raises an error
-instead of silently changing execution mode. Startup profiling and warmup
-execute before serving; they are not request-time eager fallbacks.
+Startup warms and captures the dispatcher's predefined token buckets, then
+checks that all piecewise entries exist. Breakable GDN configuration adds
+`max_num_batched_tokens` as a final bucket when needed. This is the aggregate
+scheduler token budget, not the maximum length of one request.
 
-`FULL_AND_PIECEWISE` retains the earlier compatibility behavior: the wrapper
-selects FULL prefill capture from eligible PIECEWISE dispatches and permits
-fallback for unsupported layouts.
+At serving time, the dispatcher rounds the total scheduled tokens up to the
+smallest covering bucket. For example, `[61]`, `[17,44]`, and `[1,1,59]` reuse
+the same 64-token piecewise graphs. Their native operators still receive the
+original boundaries. Padding does not add recurrent steps or KV writes, and
+only live output rows are consumed. Changing the prefill/decode mixture does
+not create a layout-specific graph entry.
 
-For the target 128-dimension GDN model, prefill graphs specialize on the
-**token bucket**, with request capacity fixed to `max_num_seqs` (up to 64).
-Request arrivals, changing query lengths, fresh/stateful flags, and the
-prefill/decode split reuse the same graph within that bucket. GDN processes
-all requests through one packed baseline route. Chunk tables and state
-read/write indices are device tensors; the Triton state/output stages replace
-the AscendC stages that require host query/chunk attributes. Empty sentinel
-sequences make unused chunk tasks inert, and padded requests never write state.
-
-Within this graph, device query lengths select a direct recurrent GDN kernel
-for single-token rows. Both routes use compact device work queues; multi-token rows use
-a fused state/output kernel. A fixed set of workers processes only live
-multi-token requests, keeps recurrent state within the kernel, and writes
-directly to physical SSM cache slots. The graph does not materialize packed
-initial/final states, per-chunk hidden-state snapshots, or `v_new` between
-the state and output stages. Fresh first chunks skip `W @ H` and `Q @ H`.
-The two paths write disjoint rows; changing the decode/prefill mix does not
-require a new graph specialization. The fused kernel preserves BF16 products
-and FP32 recurrence rather than enabling the fresh-only FP16 PTO MegaGDN path.
-
-Both ACL wrappers consult the shared native prefill dispatcher before normal
-graph dispatch. An outer ACL wrapper reuses an existing native wrapper's
-sealed registry. With debug logging enabled, `FULL prefill replay hit` records
-the bucket, sealed status, and entry count for actual replay calls.
-
-Metadata refresh uses one device launch per shared GDN metadata group for
-query boundaries, state slots, initial-state flags, both compact work
-queues, and all three chunk tables. Attention query boundaries, device KV
-lengths, KV slots, and block tables are also refreshed in one launch per
-shared attention metadata group. Request count and live token count
-are runtime scalars, so arrivals and ragged continuation chunks do not create
-new metadata-kernel specializations. This replaces eight tensor operations and
-three GDN metadata launches, plus seven FIA buffer operations. Capacity
-attention now reads these device buffers directly, so capacity entries do not
-allocate FIA task-update handles, external events, or an update stream. The
-serving path no longer synchronizes the current stream before each capacity
-replay. Copies, metadata refresh, and replay remain ordered on the request
-stream. Capture and graph destruction still synchronize where required.
-The standard builder's CPU sequence-length fields share one persistent tensor,
-avoiding a duplicate host tensor allocation and copy on each refresh.
-
-With `FULL_AND_PIECEWISE`, the first use of a token bucket still pays
-lazy capture cost. Warmup should cover the aggregate batch token buckets,
-not just the maximum length of one prompt. In particular, prompts shorter
-than 768 tokens can collectively fill a larger bucket under concurrent load.
-The default scheduler and aggregate capture sizes are unchanged.
-
-Capacity attention uses a persistent Triton paged causal-attention kernel
-with device query lengths, KV lengths, and block tables. It supports matching
-FP16/BF16 query and KV tensors, GQA, sliding-window attention, and cache head
-dimensions 64, 128, or 256 and cache page sizes divisible by 16. Query work
-is compacted once per shared metadata refresh into a graph-owned device table.
-Each attention K/V tile uses one scalar page lookup and stays within that page,
-keeping scans and page gathers out of the attention matmul kernel. This is a
-source workaround for the reported CANN 9.0.1 `llvm.func @malloc` lowering
-failure; successful compilation still needs confirmation on Ascend.
-Empty request rows and token padding do not create attention work;
-padded KV slots remain `-1`. Legacy layout-specialized FIA
-entries retain their private task-update handles and events. Standard decode
-graphs retain their existing implementation.
-
-These replacements target the measured replay host waits and GDN state/output
-cost; they are not a measured latency result. CPU numerical and dispatch tests
-cannot establish Ascend compilation, device accuracy, or speed. The NPU tests
-in `tests/ut/ops/a2/test_gdn_full_graph.py` and
-`tests/ut/ops/a2/test_graph_attention.py` exercise compilation and repeated
-graph replay with reference outputs. Real-weight mixed-serving accuracy and
-profiling on 910B remain required before claiming the regression is resolved.
-
-Replay copies current tokens, positions, KV slots, and recurrent-state indices
-into private graph buffers. On a mixed/stateful cache miss, active convolution
-and SSM rows are saved on device and restored after warmup and capture. The
-first replay advances the existing state exactly once. These temporary copies
-are released after capture; steady replay uses the normal GDN state cache.
-
-In `FULL`, `full_prefill_graph_max_entries` limits the number of prefill token
-capacities. A smaller limit coarsens the capacities and increases padding;
-it never reduces token coverage or evicts a graph during serving. A limit of
-one uses the scheduler ceiling for all prefills/mixed batches; zero is rejected.
-Without an explicit limit, every configured capacity up to the scheduler
-budget is retained, together with that budget's ceiling. Graph memory and
-startup time increase with the number of retained capacities and input forms.
-
-In `FULL_AND_PIECEWISE`, the default capacity cache has room for every configured token bucket
-(at least 8 entries). Unsupported geometries retain the earlier
-layout-specialized path, limited to 8 entries by default. New entries beyond
-the configured limit use PIECEWISE without evicting existing graphs.
-Set `full_prefill_graph_max_entries` in
-`--additional-config` to change this non-negative limit; `0` disables FULL
-prefill capture. The first use of an admitted layout includes warmup and
-capture, so performance validation should distinguish capture from replay.
-
-This preserves the standard decode-only FULL
-dispatch invariant described in [vLLM #55123](https://github.com/vllm-project/vllm/pull/55123).
-The next metadata backend should consume the device-side FIA tiling interface
-in [Ascend #15336](https://github.com/vllm-project/vllm-ascend/pull/15336), whose
-custom operators are not present in this checkout. GDN metadata is already
-device-driven; FIA still uses host task updates. Persistent per-entry buffer ownership
-follows the same constraint highlighted by
-[Ascend #15246](https://github.com/vllm-project/vllm-ascend/pull/15246).
-
-Continuation here uses `mamba_cache_mode="none"` and the existing single state
-anchor. All-mode prefix caching, block checkpoints, and separate read/write
-anchors from [vLLM #54637](https://github.com/vllm-project/vllm/pull/54637) and
-[#26807](https://github.com/vllm-project/vllm/pull/26807) are not implemented;
-their metadata is rejected by this capture path until the corresponding
-Ascend kernels and builder integration are available. No alternate block or
-checkpoint manager is introduced. CPU contract tests cover routing, capture
-rollback, stateful GDN slicing/writeback, request arrivals within one captured
-bucket, and attention metadata ownership. The Triton state/output kernels
-also run under CPU pointer emulation against a recurrent numerical reference
-with poisoned padding. This does not validate Triton compilation on Ascend:
-NPU arithmetic, capture legality, and performance remain unvalidated.
-Single-token recurrence tests also cover 4, 10, and 64 consecutive updates
-with reordered requests, cache-slot reuse, grouped heads, and strided state
-and gate tensors, including exact preservation of inactive slots.
-Ascend compile/run regressions are in
-`tests/ut/ops/a2/test_gdn_full_graph.py`; they cover Boolean/byte predicates and
-direct cache access against staged recurrence. The real-weight startup test
-`tests/e2e/pull_request/one_card/aclgraph/test_qwen3_5_full_startup.py` also
-requires serving replay hits with an unchanged sealed registry.
+Graph coverage is limited by the final effective capture sizes after platform
+and parallelism compatibility checks. The configuration above targets one NPU.
+Graph warmup does not guarantee every native operator specialization is already
+compiled for every possible layout. Ascend startup/replay accuracy and mixed
+serving latency must still be validated on hardware; CPU contract tests do not
+establish either accuracy or performance on NPU.
 
 ## Common Limitations and Caveats
 

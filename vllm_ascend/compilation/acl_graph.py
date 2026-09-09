@@ -22,7 +22,7 @@ from vllm.platforms import current_platform
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 
-from ..utils import check_gdn_layer, weak_ref_tensors
+from ..utils import weak_ref_tensors
 
 _acl_graph_wrappers: weakref.WeakSet[Any] = weakref.WeakSet()
 _STREAM_RESOURCE_ERROR_CODE = "207008"
@@ -114,23 +114,6 @@ class ACLGraphWrapper:
         self.concrete_aclgraph_entries: dict[BatchDescriptor, ACLGraphEntry] = {}
         self.enable_enpu = enable_enpu
         self.use_eagle = use_eagle
-        self._full_prefill_wrapper = None
-        if (
-            runtime_mode == CUDAGraphMode.FULL
-            and self.compilation_config.cudagraph_mode == CUDAGraphMode.FULL
-            and check_gdn_layer(vllm_config)
-            and not enable_enpu
-        ):
-            # Circular import: the native wrapper uses graph parameter helpers
-            # from this module. Reuse an existing owner and its sealed registry.
-            from vllm_ascend.compilation.breakable_aclgraph import BreakableACLGraphWrapper
-
-            self._full_prefill_wrapper = (
-                runnable
-                if isinstance(runnable, BreakableACLGraphWrapper)
-                else BreakableACLGraphWrapper(runnable, vllm_config, use_eagle=use_eagle)
-            )
-            self.full_prefill = self._full_prefill_wrapper.full_prefill
         _acl_graph_wrappers.add(self)
 
     def __getattr__(self, key: str):
@@ -148,17 +131,6 @@ class ACLGraphWrapper:
         return self.runnable
 
     def __call__(self, *args, **kwargs):
-        if self._full_prefill_wrapper is not None:
-            if self.runnable is self._full_prefill_wrapper:
-                # An already warmed native wrapper also owns decode entries.
-                # Delegate the whole call to avoid nested decode capture or
-                # replacing its registry with this outer wrapper's empty one.
-                return self.runnable(*args, **kwargs)
-            handled, output = self._full_prefill_wrapper.try_full_prefill(
-                args, kwargs, decode_entries=self.concrete_aclgraph_entries
-            )
-            if handled:
-                return output
         forward_context = get_forward_context()
         batch_descriptor = forward_context.batch_descriptor
         aclgraph_runtime_mode = forward_context.cudagraph_runtime_mode
@@ -384,15 +356,6 @@ def update_graph_params_workspaces(num_tokens: int, workspace: torch.Tensor):
 
 
 def get_graph_params():
-    # Native prefill/mixed graphs own their handles and metadata separately
-    # from decode's token-count cache. Two packed layouts can have the same
-    # token count; sharing handles would update the wrong captured graph.
-    try:
-        params = getattr(get_forward_context(), "full_prefill_graph_params", None)
-    except (AssertionError, LookupError, RuntimeError):
-        params = None
-    if params is not None:
-        return params
     return _select_graph_params(_graph_params)
 
 

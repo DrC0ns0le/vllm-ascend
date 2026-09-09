@@ -522,7 +522,6 @@ class _ExtraForwardContextProxy:
 
     extra_attrs = (
         "capturing",
-        "full_prefill_graph_params",
         "moe_comm_type",
         "moe_comm_method",
         "use_mega_moe",

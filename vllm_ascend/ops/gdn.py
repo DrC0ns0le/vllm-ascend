@@ -35,12 +35,10 @@ from vllm_ascend import envs
 from vllm_ascend.attention.utils import maybe_save_kv_layer_to_connector
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.ops.gdn_attn_builder import AscendGDNAttentionBackend
-from vllm_ascend.ops.gdn_graph_metadata import GDNFullGraphMetadata
 from vllm_ascend.ops.pto_chunk_gdn.backend import MegaGDNBackend
 from vllm_ascend.ops.pto_chunk_gdn.eligibility import HEAD_DIM
 from vllm_ascend.ops.triton.fla.chunk import chunk_gated_delta_rule
 from vllm_ascend.ops.triton.fla.fused_qkvzba_split_reshape import fused_qkvzba_split_reshape_cat
-from vllm_ascend.ops.triton.fla.graph import chunk_gated_delta_rule_graph
 from vllm_ascend.ops.triton.fla.utils import clear_ssm_states
 from vllm_ascend.ops.triton.mamba.causal_conv1d import extract_last_width
 
@@ -171,33 +169,6 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             output[:num_tokens] = out
         return out
 
-    def _forward_full_graph(self, mixed_qkv, b, a, core_attn_out, metadata):
-        # One packed operator route for fresh/stateful prefill and decode.
-        # Sequence boundaries, initial-state flags, and cache slots change
-        # on device; no Python split or tensor shape depends on their values.
-        convolved = torch.empty_like(mixed_qkv)
-        torch.ops._C_ascend.npu_causal_conv1d_custom(
-            convolved,
-            mixed_qkv,
-            self.conv1d.weight.view(self.conv1d.weight.size(0), -1).transpose(0, 1),
-            conv_state=self.kv_cache[0],
-            bias_opt=self.conv1d.bias,
-            query_start_loc_opt=metadata.query_start_loc,
-            cache_indices_opt=metadata.state_write_indices,
-            initial_state_mode_opt=metadata.has_initial_state,
-            num_accepted_tokens_opt=None,
-            activation_mode=1 if self.activation else 0,
-            pad_slot_id=PAD_SLOT_ID,
-            run_mode=0,
-        )
-        query, key, value = self.rearrange_mixed_qkv(convolved)
-        g, beta = DeviceOperator.fused_gdn_gating(self.A_log, a, b, self.dt_bias)
-        # Write only real tokens into the caller's zeroed output; copying an
-        # uninitialized padded tail would defeat the layer's padding contract.
-        chunk_gated_delta_rule_graph(
-            query, key, value, g, beta, self.kv_cache[1], metadata, output=core_attn_out.unsqueeze(0)
-        )
-
     def _forward_core(
         self,
         mixed_qkv: torch.Tensor,
@@ -222,9 +193,6 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         assert isinstance(attn_metadata, dict)
         attn_metadata = attn_metadata[self.prefix]
-        if isinstance(attn_metadata, GDNFullGraphMetadata):
-            self._forward_full_graph(mixed_qkv, b, a, core_attn_out, attn_metadata)
-            return
         assert isinstance(attn_metadata, GDNAttentionMetadata)
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
@@ -473,10 +441,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             prefill_impl = chunk_gated_delta_rule
             backend_kwargs = {}
             backend = getattr(self, "pto_gdn_backend", None)
-            # Phase 1 FULL prefill captures the baseline core. MegaGDN stays
-            # on the existing PIECEWISE path until its captured launch is
-            # validated independently.
-            if backend is not None and not getattr(forward_context, "full_prefill_graph", False):
+            if backend is not None:
                 prefill_impl = backend
                 backend_kwargs = {
                     "fresh_prefill": attn_metadata.non_spec_prefill_metadata.chunk.fresh_prefill,

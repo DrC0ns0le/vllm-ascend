@@ -133,7 +133,6 @@ from vllm_ascend.compilation.acl_graph import (
     update_full_graph_params,
 )
 from vllm_ascend.compilation.breakable_aclgraph import BreakableACLGraphWrapper
-from vllm_ascend.compilation.full_graph_policy import FullGraphCapacityPolicy
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_cache_layout import (
     apply_layerwise_kv_cache_plan,
 )
@@ -312,10 +311,6 @@ class ExecuteModelState(NamedTuple):
 
 class NPUModelRunner(GPUModelRunner):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
-        self.full_graph_policy = None
-        requested_native_full = (
-            check_gdn_layer(vllm_config) and vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.FULL
-        )
         # Must be set before super().__init__() because parent init may call
         # _allocate_kv_cache_tensors which accesses self.use_compress.
         model_config = getattr(vllm_config, "model_config", None)
@@ -352,21 +347,6 @@ class NPUModelRunner(GPUModelRunner):
         # gdn_query_start_loc is an unpadded version of query_start_loc.
         # TODO delete it if fia's check is removed.
         self._has_gdn = check_gdn_layer(vllm_config)
-        if requested_native_full:
-            if self.compilation_config.cudagraph_mode != CUDAGraphMode.FULL:
-                raise ValueError("Requested GDN FULL execution was downgraded during initialization")
-            if not breakable_cudagraph.is_breakable_cudagraph_enabled():
-                raise ValueError("GDN FULL-only execution requires breakable ACLGraph to be enabled")
-            self.full_graph_policy = FullGraphCapacityPolicy.build(
-                self.scheduler_config.max_num_batched_tokens,
-                self.scheduler_config.max_num_seqs,
-                self.compilation_config.cudagraph_capture_sizes or (),
-                (vllm_config.additional_config or {}).get("full_prefill_graph_max_entries"),
-            )
-            # Standard FULL decode must also cover every request count.
-            sizes = sorted(set(self.compilation_config.cudagraph_capture_sizes or ()) | {self.max_num_reqs})
-            self.compilation_config.cudagraph_capture_sizes = sizes
-            self.compilation_config.max_cudagraph_capture_size = max(sizes)
         self._has_sinks = False
         if self._has_gdn:
             self.gdn_query_start_loc = self._make_buffer(
@@ -890,9 +870,8 @@ class NPUModelRunner(GPUModelRunner):
         """
         # TODO: need refactor later, related to vllm PR #34043 this pr delete func
         # relax_for_mixed_batch_cudagraphs, num_reqs no longer equals the actual number of requests.
-        native_decode = self.full_graph_policy is not None and batch_desc_num_reqs is not None
         if cudagraph_runtime_mode == CUDAGraphMode.FULL and \
-            self.compilation_config.cudagraph_mode == CUDAGraphMode.FULL and not native_decode:
+            self.compilation_config.cudagraph_mode == CUDAGraphMode.FULL:
             num_reqs_padded = num_reqs
         else:
             num_reqs_padded = batch_desc_num_reqs if batch_desc_num_reqs is not None else num_reqs
@@ -902,7 +881,7 @@ class NPUModelRunner(GPUModelRunner):
         # will cause tokens are padded but requests are not
         if (
             num_tokens_padded == num_reqs_padded * self.uniform_decode_query_len
-            and (self.compilation_config.cudagraph_mode != CUDAGraphMode.FULL or native_decode)
+            and self.compilation_config.cudagraph_mode != CUDAGraphMode.FULL
         ):
             # Uniform-batch case: num_reqs must be no greater than num_reqs_padded
             assert num_reqs <= num_reqs_padded
@@ -2091,10 +2070,7 @@ class NPUModelRunner(GPUModelRunner):
                 ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
 
                 if (
-                    (
-                        cudagraph_mode == CUDAGraphMode.FULL
-                        and not (self.full_graph_policy is not None and not batch_desc.uniform)
-                    )
+                    cudagraph_mode == CUDAGraphMode.FULL
                     or (enable_sp() and not self.model_config.use_mla)
                     and self.dcp_size == 1
                 ):
@@ -2717,9 +2693,6 @@ class NPUModelRunner(GPUModelRunner):
         forward_context: ForwardContext,
         num_tokens_padded: int,
     ) -> None:
-        if self.full_graph_policy is not None and not getattr(forward_context.batch_descriptor, "uniform", False):
-            # Native mixed graphs own and update their FIA tasks in the wrapper.
-            return
         if (
             forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL
             and not forward_context.capturing
@@ -2871,12 +2844,6 @@ class NPUModelRunner(GPUModelRunner):
 
         # ruff: noqa: E731
         def dispatch_cudagraph(num_tokens, disable_full=False, valid_modes=None):
-            if self.full_graph_policy is not None and force_uniform_decode is None:
-                if force_eager or disable_full or has_lora:
-                    raise RuntimeError("FULL-only serving cannot execute an eager, cascade, encoder, or LoRA batch")
-                if not uniform_decode:
-                    capacity = self.full_graph_policy.capacity(num_tokens, num_reqs)
-                    return CUDAGraphMode.FULL, BatchDescriptor(capacity, num_reqs=None, uniform=False)
             if force_eager:
                 return (CUDAGraphMode.NONE, BatchDescriptor(num_tokens_padded))
 
@@ -2890,8 +2857,6 @@ class NPUModelRunner(GPUModelRunner):
             )
 
         cudagraph_mode, batch_descriptor = dispatch_cudagraph(num_tokens_padded, use_cascade_attn or has_encoder_output)
-        if self.full_graph_policy is not None and force_uniform_decode is None and cudagraph_mode != CUDAGraphMode.FULL:
-            raise RuntimeError("FULL-only decode has no covering graph capacity")
         num_tokens_padded = batch_descriptor.num_tokens
         if enable_sp(self.vllm_config):
             assert batch_descriptor.num_tokens % self.vllm_config.parallel_config.tensor_parallel_size == 0, (
@@ -3328,10 +3293,8 @@ class NPUModelRunner(GPUModelRunner):
         profile_seq_lens: int | None = None,
         profile_cpp: bool = False,
         skip_gdn_state_update: bool = False,
-        native_full_graph: bool = False,
-        native_input_ids: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Startup warmup and graph capture share this dummy input builder.
+        # only support eager mode and piecewise graph now
         assert cudagraph_runtime_mode is None or cudagraph_runtime_mode.valid_runtime_modes()
         # If cudagraph_mode.decode_mode() == FULL and
         # cudagraph_mode.separate_routine(). This means that we are using
@@ -3352,11 +3315,7 @@ class NPUModelRunner(GPUModelRunner):
         # has num_tokens in total.
         assert num_tokens <= self.scheduler_config.max_num_batched_tokens
         max_num_reqs = self.scheduler_config.max_num_seqs
-        if native_full_graph:
-            num_scheduled_tokens_list = self.full_graph_policy.dummy_lengths(num_tokens, self.max_model_len)
-            num_reqs = len(num_scheduled_tokens_list)
-            max_query_len = max(num_scheduled_tokens_list)
-        elif create_mixed_batch:
+        if create_mixed_batch:
             raise NotImplementedError("create_mixed_batch is used for warmup deepgemm, vllm-ascend does not need it")
         elif uniform_decode:
             num_reqs = min(max_num_reqs, cdiv(num_tokens, max_query_len))
@@ -3381,25 +3340,25 @@ class NPUModelRunner(GPUModelRunner):
         self.query_lens = torch.from_numpy(num_scheduled_tokens)
         num_tokens_unpadded = int(num_scheduled_tokens.sum())
         num_sampled_tokens = np.ones(num_reqs, dtype=np.int32)
-        if native_full_graph:
-            _cudagraph_mode = CUDAGraphMode.FULL
-            batch_desc = BatchDescriptor(num_tokens, num_reqs=None, uniform=False)
-            num_tokens_across_dp = None
-        else:
-            _cudagraph_mode, batch_desc, _, num_tokens_across_dp, _ = self._determine_batch_execution_and_padding(
-                num_tokens=num_tokens_unpadded,
-                num_reqs=num_reqs,
-                num_scheduled_tokens_np=num_scheduled_tokens,
-                max_num_scheduled_tokens=max_query_len,
-                use_cascade_attn=False,
-                allow_microbatching=allow_microbatching,
-                force_eager=is_profile or (cudagraph_runtime_mode == CUDAGraphMode.NONE) or profile_cpp,
-                # Startup descriptors explicitly distinguish uniform decode
-                # from mixed batches whose dummy query lengths happen to be 1.
-                force_uniform_decode=uniform_decode,
-                force_has_lora=num_active_loras > 0,
-                force_num_active_loras=num_active_loras,
-            )
+        _cudagraph_mode, batch_desc, _, num_tokens_across_dp, _ = self._determine_batch_execution_and_padding(
+            num_tokens=num_tokens_unpadded,
+            num_reqs=num_reqs,
+            num_scheduled_tokens_np=num_scheduled_tokens,
+            max_num_scheduled_tokens=max_query_len,
+            use_cascade_attn=False,
+            allow_microbatching=allow_microbatching,
+            force_eager=is_profile or (cudagraph_runtime_mode == CUDAGraphMode.NONE) or profile_cpp,
+            # `force_uniform_decode` is used for cudagraph capture; because for
+            # capturing mixed prefill-decode batches, we sometimes use
+            # num_tokens == num_reqs which looks like a uniform decode batch to the
+            # dispatcher; but we actually want to capture a piecewise cudagraph
+            force_uniform_decode=uniform_decode,
+            # `force_has_lora` is used for cudagraph capture; because LoRA is
+            # activated later in the context manager, but we need to know the
+            # LoRA state when determining the batch descriptor for capture
+            force_has_lora=num_active_loras > 0,
+            force_num_active_loras=num_active_loras,
+        )
         if self.use_dcp:
             self.dcp_manager.init_batch_info(
                 num_scheduled_tokens,
@@ -3442,9 +3401,7 @@ class NPUModelRunner(GPUModelRunner):
                     raise NotImplementedError(
                         "create_mixed_batch is used for warmup deepgemm, vllm-ascend does not need it"
                     )
-                self.attn_state = (
-                    AscendAttentionState.PrefillNoCache if native_full_graph else AscendAttentionState.DecodeOnly
-                )
+                self.attn_state = AscendAttentionState.DecodeOnly
                 if self.speculative_config and self.speculative_config.method == "mtp":
                     # `AscendAttentionState.SpecDecoding` is only designed for mla
                     if self.vllm_config.model_config.use_mla:
@@ -3465,13 +3422,7 @@ class NPUModelRunner(GPUModelRunner):
                         else max_query_len
                     )  # type: ignore[assignment]
 
-                if native_full_graph:
-                    lengths = torch.from_numpy(num_scheduled_tokens)
-                    self.optimistic_seq_lens_cpu[:num_reqs].copy_(lengths)
-                    self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs].zero_()
-                    self.input_batch.num_prompt_tokens_cpu_tensor[:num_reqs].copy_(lengths)
-                else:
-                    self.optimistic_seq_lens_cpu[:num_reqs] = seq_lens
+                self.optimistic_seq_lens_cpu[:num_reqs] = seq_lens
                 self.optimistic_seq_lens_cpu[num_reqs:].fill_(0)
                 self.seq_lens.copy_(self.optimistic_seq_lens_cpu, non_blocking=True)
 
@@ -3486,7 +3437,7 @@ class NPUModelRunner(GPUModelRunner):
                         self.gdn_query_start_loc.np[1 : num_reqs_padded + 1] = cum_num_tokens
                     self.gdn_query_start_loc.copy_to_gpu()
 
-                if not profile_cpp and not native_full_graph:
+                if not profile_cpp:
                     num_reqs_padded = self._pad_query_start_loc_for_fia(
                         self.query_start_loc,
                         num_tokens_padded,
@@ -3520,24 +3471,10 @@ class NPUModelRunner(GPUModelRunner):
                     num_reqs_padded=num_reqs_padded,
                     max_query_len=max_query_len,
                     ubatch_slices=ubatch_slices_padded if pad_attn else ubatch_slices,
-                    for_cudagraph_capture=is_graph_capturing and not native_full_graph,
+                    for_cudagraph_capture=is_graph_capturing,
                     num_scheduled_tokens_np=num_scheduled_tokens,
                     skip_gdn_state_update=skip_gdn_state_update,
                 )
-                if native_full_graph:
-                    # Exercise the maximum live request count and KV context
-                    # during workspace sizing. GDN's fresh flags were already
-                    # built from the actual dummy query lengths above.
-                    seen = set()
-                    for metadata in attn_metadata.values():
-                        if type(metadata).__name__ == "AscendMetadata" and id(metadata) not in seen:
-                            seen.add(id(metadata))
-                            # The builder aliases optimistic_seq_lens_cpu,
-                            # which may still be an in-flight H2D source for
-                            # GDN. Size FIA workspaces using separate storage.
-                            metadata.seq_lens = metadata.seq_lens.new_full((num_reqs,), self.max_model_len)
-                            metadata.seq_lens_cpu = metadata.seq_lens
-                            metadata.seq_lens_list[:] = [self.max_model_len] * num_reqs
         with self.maybe_dummy_run_with_lora(
             self.lora_config,
             num_scheduled_tokens,
@@ -3556,10 +3493,6 @@ class NPUModelRunner(GPUModelRunner):
             else:
                 input_ids = self.input_ids.gpu[:num_tokens_padded]
                 inputs_embeds = None
-
-            if native_full_graph:
-                input_ids = self.input_ids.gpu[:num_tokens_padded] if native_input_ids else None
-                inputs_embeds = None if native_input_ids else self.inputs_embeds.gpu[:num_tokens_padded]
 
             if self.uses_mrope:
                 positions = self.mrope_positions.gpu[:, :num_tokens_padded]
@@ -3856,8 +3789,6 @@ class NPUModelRunner(GPUModelRunner):
                     use_eagle=self.use_eagle,
                     enable_enpu=self.enable_enpu,
                 )
-                if self.full_graph_policy is not None and (self.enable_enpu or not self.model.full_prefill.enabled):
-                    raise ValueError("Native GDN FULL-only configuration is unsupported; fallback is disabled")
             elif self.compilation_config.cudagraph_mode.has_full_cudagraphs():
                 self.model = ACLGraphWrapper(
                     self.model,
@@ -5095,29 +5026,18 @@ class NPUModelRunner(GPUModelRunner):
                     min_cg_attn_backend = attn_backend.__name__
 
         with update_pass_config(self):
-            requested_mode = self.compilation_config.cudagraph_mode
-            if self.full_graph_policy is not None:
-                # Only standard decode goes through upstream's decode-only
-                # FULL invariant. Native mixed capacities are captured below.
-                self.compilation_config.cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
-            try:
-                cudagraph_mode = self.compilation_config.resolve_cudagraph_mode_and_sizes(
-                    min_cg_support=min_cg_support,
-                    min_cg_attn_backend=min_cg_attn_backend,
-                    uniform_decode_query_len=self.uniform_decode_query_len,
-                    use_v2_model_runner=False,
-                    tensor_parallel_size=self.parallel_config.tensor_parallel_size,
-                    kv_cache_config=self.kv_cache_config,
-                    max_num_reqs=self.max_num_reqs,
-                )
-                if self.full_graph_policy is not None and cudagraph_mode != CUDAGraphMode.FULL_DECODE_ONLY:
-                    raise ValueError("FULL-only GDN requires standard FULL decode support")
-                self.cudagraph_dispatcher.initialize_cudagraph_keys(
-                    cudagraph_mode, self.uniform_decode_query_len
-                )
-            finally:
-                if self.full_graph_policy is not None:
-                    self.compilation_config.cudagraph_mode = requested_mode
+            cudagraph_mode = self.compilation_config.resolve_cudagraph_mode_and_sizes(
+                min_cg_support=min_cg_support,
+                min_cg_attn_backend=min_cg_attn_backend,
+                uniform_decode_query_len=self.uniform_decode_query_len,
+                use_v2_model_runner=False,
+                tensor_parallel_size=self.parallel_config.tensor_parallel_size,
+                kv_cache_config=self.kv_cache_config,
+                max_num_reqs=self.max_num_reqs,
+            )
+            self.cudagraph_dispatcher.initialize_cudagraph_keys(
+                cudagraph_mode, self.uniform_decode_query_len
+            )
 
         if (
             self.speculative_config
@@ -5153,66 +5073,6 @@ class NPUModelRunner(GPUModelRunner):
                     )
                 set_draft_graph_params(draft_capture_sizes)
 
-    def _capture_native_full_graphs(self) -> None:
-        """Capture all mixed capacities before serving, with isolated dummy state."""
-        policy = self.full_graph_policy
-        if policy is None:
-            return
-        if not isinstance(self.model, BreakableACLGraphWrapper) and not isinstance(
-            getattr(self.model, "_full_prefill_wrapper", None), BreakableACLGraphWrapper
-        ):
-            raise RuntimeError("Native FULL capture requires the breakable wrapper")
-        # Standard decode capture can use another stream. Finish it before
-        # borrowing and snapshotting any recurrent cache rows for warmup.
-        torch.npu.synchronize()
-        rows = len(policy.dummy_lengths(policy.max_tokens, self.max_model_len))
-        saved_states, seen = [], set()
-        for layer in self.compilation_config.static_forward_context.values():
-            states = getattr(layer, "kv_cache", ())
-            if not isinstance(states, (tuple, list)) or len(states) != 2:
-                continue
-            for state in states:
-                if not isinstance(state, torch.Tensor) or id(state) in seen:
-                    continue
-                if state.shape[0] < rows:
-                    raise ValueError("Insufficient recurrent cache slots for FULL startup capture")
-                seen.add(id(state))
-                saved_states.append((state[:rows], state[:rows].clone()))
-        saved_tables = []
-        computed = self.input_batch.num_computed_tokens_cpu_tensor[:rows]
-        prompts = self.input_batch.num_prompt_tokens_cpu_tensor[:rows]
-        saved_computed, saved_prompts = computed.clone(), prompts.clone()
-        self.model.full_prefill.begin_capture()
-        try:
-            for gid, group in enumerate(self.kv_cache_config.kv_cache_groups):
-                if isinstance(group.kv_cache_spec, MambaSpec):
-                    table = self.input_batch.block_table[gid].block_table
-                    saved_tables.append((table, table.cpu[:rows].clone()))
-                    # Each dummy sequence gets a distinct physical state row.
-                    table.cpu[:rows, 0].copy_(torch.arange(rows, dtype=table.cpu.dtype))
-            input_modes = (True, False) if self.supports_mm_inputs or self.enable_prompt_embeds else (True,)
-            for capacity in reversed(policy.capacities):
-                for input_ids in input_modes:
-                    self._dummy_run(
-                        capacity,
-                        cudagraph_runtime_mode=CUDAGraphMode.FULL,
-                        force_attention=True,
-                        native_full_graph=True,
-                        native_input_ids=input_ids,
-                    )
-            self.model.full_prefill.seal()
-        finally:
-            self.model.full_prefill.sealed = True
-            torch.npu.current_stream().synchronize()
-            for target, saved in saved_states:
-                target.copy_(saved)
-            computed.copy_(saved_computed)
-            prompts.copy_(saved_prompts)
-            for table, saved in saved_tables:
-                table.cpu[:rows].copy_(saved)
-                table.copy_to_gpu(rows)
-        logger.info("FULL-only mixed graph capacities ready: %s", policy.capacities)
-
     def capture_model(self) -> int:
         """Capture NPU graphs and return actual graph pool memory bytes consumed."""
         parent_module_name = _get_gpu_model_runner_module_name(self)
@@ -5220,11 +5080,8 @@ class NPUModelRunner(GPUModelRunner):
         free_before, _ = torch.npu.mem_get_info()
         with _torch_cuda_wrapper(), _replace_gpu_model_runner_function_wrapper(parent_module_name):
             cuda_graph_size = GPUModelRunner.capture_model(self)
-            if self.full_graph_policy is not None:
-                native_free_before, _ = torch.npu.mem_get_info()
-                self._capture_native_full_graphs()
-                native_free_after, _ = torch.npu.mem_get_info()
-                cuda_graph_size += max(0, native_free_before - native_free_after)
+            if isinstance(self.model, BreakableACLGraphWrapper):
+                self.model.validate_piecewise_capture(self.cudagraph_dispatcher.get_capture_descs())
         free_after, _ = torch.npu.mem_get_info()
         logger.info(
             "ACLGraph capture summary: sizes=%s duration_s=%.3f free_before=%d free_after=%d memory_delta=%d",

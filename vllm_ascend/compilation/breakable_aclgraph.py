@@ -23,10 +23,9 @@ from time import perf_counter
 from typing import Any
 
 import torch
-from vllm.compilation import monitor as cudagraph_monitor
 from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphWrapper
 from vllm.config import CUDAGraphMode, VllmConfig
-from vllm.forward_context import get_forward_context, is_forward_context_available
+from vllm.forward_context import get_forward_context
 from vllm.logger import logger
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
@@ -36,7 +35,6 @@ from vllm_ascend.compilation.acl_graph import (
     get_graph_params,
     weak_ref_workspaces,
 )
-from vllm_ascend.compilation.full_prefill import FullPrefillGraphCache
 
 
 class BreakableACLGraphWrapper(BreakableCUDAGraphWrapper):
@@ -54,51 +52,23 @@ class BreakableACLGraphWrapper(BreakableCUDAGraphWrapper):
 
         self.use_eagle = use_eagle
         self.enable_enpu = enable_enpu
-        self.full_prefill = FullPrefillGraphCache(vllm_config)
 
-    def __call__(self, *args, **kwargs):
-        handled, output = self.try_full_prefill(args, kwargs)
-        if handled:
-            return output
-        return super().__call__(*args, **kwargs)
-
-    def try_full_prefill(self, args, kwargs, *, decode_entries=None):
-        """Shared admission/replay path, including when wrapped by ACLGraph."""
-        if not self.enable_enpu and is_forward_context_available():
-            handled, output = self.full_prefill.run(
-                get_forward_context(),
-                args,
-                kwargs,
-                runnable=self.runnable,
-                capture=self._capture,
-                replay=self._replay,
+    def validate_piecewise_capture(self, capture_descs):
+        """Check the parent's startup capture covered all mixed token buckets."""
+        if self.compilation_config.cudagraph_mode.mixed_mode() != CUDAGraphMode.PIECEWISE:
+            return
+        descriptors = [desc for mode, descs in capture_descs if mode == CUDAGraphMode.PIECEWISE for desc in descs]
+        sizes = {desc.num_tokens for desc in descriptors}
+        missing_sizes = set(self.compilation_config.cudagraph_capture_sizes or ()) - sizes
+        missing_entries = [
+            desc for desc in descriptors if desc not in self.entries or self.entries[desc].capture is None
+        ]
+        if missing_sizes or missing_entries:
+            raise RuntimeError(
+                f"Piecewise startup capture is incomplete: missing sizes={sorted(missing_sizes)}, "
+                f"missing descriptors={missing_entries}"
             )
-            if handled:
-                return True, output
-            context = get_forward_context()
-            if (
-                self.full_prefill.full_only
-                and context.attn_metadata is not None
-                and not getattr(context, "in_profile_run", False)
-                and (self.full_prefill.sealed or context.cudagraph_runtime_mode == CUDAGraphMode.FULL)
-            ):
-                has_gdn = isinstance(context.attn_metadata, dict) and any(
-                    type(metadata).__name__ == "GDNAttentionMetadata" for metadata in context.attn_metadata.values()
-                )
-                if context.cudagraph_runtime_mode != CUDAGraphMode.FULL or (
-                    has_gdn and not getattr(context.batch_descriptor, "uniform", False)
-                ):
-                    raise RuntimeError("FULL execution cannot fall back to PIECEWISE or eager")
-                if self.full_prefill.sealed:
-                    if decode_entries is None:
-                        decode_entries = self.entries
-                    if context.batch_descriptor not in decode_entries:
-                        raise RuntimeError("FULL decode graph was not captured at startup")
-        return False, None
-
-    def clear_graphs(self):
-        self.full_prefill.clear()
-        super().clear_graphs()
+        logger.info("Piecewise ACLGraph token buckets ready: %s", sorted(sizes))
 
     def _capture(
         self,
@@ -107,10 +77,7 @@ class BreakableACLGraphWrapper(BreakableCUDAGraphWrapper):
         kwargs: dict[str, Any],
     ) -> Any:
         forward_context = get_forward_context()
-        is_full_capture = forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL and (
-            not getattr(forward_context, "full_prefill_graph", False)
-            or getattr(forward_context, "full_prefill_graph_params", None) is not None
-        )
+        is_full_capture = forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL
         was_capturing = forward_context.capturing
         if is_full_capture:
             # Ascend FULL graph attention creates task groups and records the
@@ -118,13 +85,6 @@ class BreakableACLGraphWrapper(BreakableCUDAGraphWrapper):
             forward_context.capturing = True
 
         started = perf_counter()
-        # Lazy prefill admission runs after vLLM disables boot-time capture.
-        # Permit this managed capture only, then restore the monitor even if
-        # the operator or the parent wrapper raises.
-        is_full_prefill_admission = getattr(forward_context, "full_prefill_graph", False)
-        was_capture_enabled = cudagraph_monitor.cudagraph_capturing_enabled
-        if is_full_prefill_admission:
-            cudagraph_monitor.set_cudagraph_capturing_enabled(True)
         try:
             output = super()._capture(entry, args, kwargs)
         except Exception:
@@ -135,19 +95,12 @@ class BreakableACLGraphWrapper(BreakableCUDAGraphWrapper):
                 entry.batch_descriptor,
             )
             raise
-        finally:
-            if is_full_prefill_admission:
-                cudagraph_monitor.set_cudagraph_capturing_enabled(was_capture_enabled)
 
         if is_full_capture:
             # Keep the same workspace lifetime contract as ACLGraphWrapper.
             weak_ref_workspaces(get_graph_params())
-            if not getattr(forward_context, "full_prefill_graph", False):
-                weak_ref_workspaces(get_draft_graph_params())
-                weak_ref_workspaces(get_draft_graph_prefill_params())
-
-        if self.full_prefill.full_only and (entry.capture.num_graphs != 1 or entry.capture.num_eager_breaks != 0):
-            raise RuntimeError("FULL capture must contain exactly one graph and no eager breaks")
+            weak_ref_workspaces(get_draft_graph_params())
+            weak_ref_workspaces(get_draft_graph_prefill_params())
 
         # Keep capturing=True on a successful FULL capture until the caller
         # finishes: MRV1 uses it to skip replay-only attention parameter updates.
@@ -175,9 +128,7 @@ class BreakableACLGraphWrapper(BreakableCUDAGraphWrapper):
             entry.capture.num_graphs,
             entry.capture.num_eager_breaks,
         )
-        if forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL and not getattr(
-            forward_context, "full_prefill_graph", False
-        ):
+        if forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL:
             # Match ACLGraphWrapper's ordering between async attention
             # parameter updates and the previous/current FULL graph replay.
             is_draft_eagle = _EXTRA_CTX.is_draft_model and self.use_eagle

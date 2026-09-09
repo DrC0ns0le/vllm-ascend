@@ -36,7 +36,6 @@ def load_core(context, monkeypatch, saved):
         torch=torch,
         get_forward_context=lambda: context,
         GDNAttentionMetadata=SimpleNamespace,
-        GDNFullGraphMetadata=type("GDNFullGraphMetadata", (), {}),
         logging=logging,
         logger=logging.getLogger("gdn_contract"),
         get_pcp_group=lambda: SimpleNamespace(world_size=1),
@@ -123,11 +122,8 @@ def test_production_constructor_keeps_megagdn_tp1_pp1_only(tp, pp, expected):
 
 
 @pytest.mark.parametrize("enable_mega", [False, True])
-@pytest.mark.parametrize("full_graph", [False, True])
 @pytest.mark.parametrize("stateful", [False, True])
-def test_mixed_batch_only_sends_prefill_slice_and_rebased_state_to_backend(
-    monkeypatch, enable_mega, full_graph, stateful
-):
+def test_mixed_batch_only_sends_prefill_slice_and_rebased_state_to_backend(monkeypatch, enable_mega, stateful):
     model = layer()
     before = model.kv_cache[1].clone()
     saved = []
@@ -154,26 +150,22 @@ def test_mixed_batch_only_sends_prefill_slice_and_rebased_state_to_backend(
         prefill_state_indices=torch.tensor([0]),
         prefill_has_initial_state=torch.tensor([stateful]),
     )
-    core, baseline, decode = load_core(
-        SimpleNamespace(attn_metadata={"gdn": metadata}, full_prefill_graph=full_graph), monkeypatch, saved
-    )
+    core, baseline, decode = load_core(SimpleNamespace(attn_metadata={"gdn": metadata}), monkeypatch, saved)
     if enable_mega:
         model.pto_gdn_backend = Mock(side_effect=lambda **kwargs: (kwargs["v"] + 10, kwargs["initial_state"] + 5))
     inputs = torch.arange(12).reshape(6, 2).float()
     output = torch.zeros(6, 1, 2)
     core(model, inputs, torch.zeros(6, 1), torch.zeros(6, 1), output)
-    selected = model.pto_gdn_backend if enable_mega and not full_graph else baseline
+    selected = model.pto_gdn_backend if enable_mega else baseline
     selected.assert_called_once()
     passed = selected.call_args.kwargs
     torch.testing.assert_close(passed["v"].squeeze(0).squeeze(1), inputs[1:4])
     initial_state = before[:1].transpose(-1, -2) if stateful else torch.zeros(1, 1, 2, 2)
     torch.testing.assert_close(passed["initial_state"], initial_state)
     torch.testing.assert_close(passed["cu_seqlens"], torch.tensor([0, 3]))
-    if enable_mega and not full_graph:
+    if enable_mega:
         assert passed["fresh_prefill"] is not stateful
         baseline.assert_not_called()
-    elif enable_mega:
-        model.pto_gdn_backend.assert_not_called()
     torch.testing.assert_close(decode.call_args.kwargs["ssm_state_indices"], torch.tensor([2]))
     torch.testing.assert_close(output[0, 0], inputs[0] + 20)
     torch.testing.assert_close(output[1:4, 0], inputs[1:4] + 10)
@@ -209,114 +201,71 @@ def test_pure_decode_does_not_call_megagdn(monkeypatch):
     model.pto_gdn_backend.assert_not_called()
 
 
-@pytest.mark.parametrize("stateful", [False, True])
-def test_full_prefill_captures_baseline_even_when_megagdn_is_enabled(monkeypatch, stateful):
+def test_native_mixed_core_reuses_padded_buffers_across_arrivals_and_state_slots(monkeypatch):
     model = layer()
-    before = model.kv_cache[1].clone()
-    model.pto_gdn_backend = Mock(side_effect=AssertionError("phase 1 captures baseline GDN"))
-    conv = SimpleNamespace(
-        query_start_loc=torch.tensor([0, 3]),
-        cache_indices=torch.tensor([1]),
-        initial_state_mode=torch.tensor([stateful]),
-    )
-    metadata = SimpleNamespace(
-        spec_sequence_masks=None,
-        spec_token_indx=None,
-        non_spec_token_indx=None,
-        spec_state_indices_tensor=None,
-        non_spec_state_indices_tensor=torch.tensor([1]),
-        num_actual_tokens=3,
-        num_decodes=0,
-        num_prefills=1,
-        num_decode_tokens=0,
-        non_spec_prefill_metadata=SimpleNamespace(
-            causal_conv1d=conv, chunk=SimpleNamespace(fresh_prefill=not stateful)
-        ),
-        prefill_query_start_loc=torch.tensor([0, 3]),
-        prefill_state_indices=torch.tensor([1]),
-        prefill_has_initial_state=torch.tensor([stateful]),
-    )
-    core, baseline, decode = load_core(
-        SimpleNamespace(attn_metadata={"gdn": metadata}, full_prefill_graph=True), monkeypatch, []
-    )
-    inputs = torch.arange(6).reshape(3, 2).float()
-    output = torch.zeros(3, 1, 2)
-    core(model, inputs, torch.zeros(3, 1), torch.zeros(3, 1), output)
-    baseline.assert_called_once()
-    model.pto_gdn_backend.assert_not_called()
-    decode.assert_not_called()
-    torch.testing.assert_close(output[:, 0], inputs + 10)
-    expected = before[1] + 5 if stateful else torch.full((1, 2, 2), 5.0)
-    torch.testing.assert_close(model.kv_cache[1][1], expected)
-    # The next prompt chunk must consume the state written by this chunk.
-    metadata.prefill_has_initial_state.fill_(True)
-    core(model, inputs, torch.zeros(3, 1), torch.zeros(3, 1), output)
-    torch.testing.assert_close(model.kv_cache[1][1], expected + 5)
-
-
-def test_capacity_metadata_dispatches_through_patched_qwen_layer(monkeypatch):
+    model.kv_cache = (torch.zeros(70, 1, 2), torch.arange(280).reshape(70, 1, 2, 2).float())
+    model.pto_gdn_backend = None
     context = SimpleNamespace(attn_metadata={})
     core, baseline, decode = load_core(context, monkeypatch, [])
-    metadata = core.__globals__["GDNFullGraphMetadata"]()
-    context.attn_metadata["gdn"] = metadata
-
-    # Qwen's class is patched, not derived from the Ascend implementation.
-    # Execute the production patch bindings rather than manually supplying
-    # the missing helper on the layer (which hid this startup regression).
-    class QwenLayer:
-        prefix = "gdn"
-
-    full_graph = Mock()
-    ascend = SimpleNamespace(
-        _forward_core=core,
-        _forward_full_graph=full_graph,
-        forward=Mock(),
-        _warmup_prefill_kernels=Mock(),
-    )
-    path = Path(__file__).resolve().parents[4] / "vllm_ascend/patch/worker/patch_qwen3_5.py"
-    tree = ast.parse(path.read_text())
-    hardware_patch = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.If) and isinstance(node.test, ast.Call) and ast.unparse(node.test.func) == "is_310p"
-    )
-    namespace = dict(_GDN_PATCH_TARGET=QwenLayer, AscendGatedDeltaNetAttention=ascend, is_310p=lambda: False)
-    exec(compile(ast.Module(body=[hardware_patch], type_ignores=[]), str(path), "exec"), namespace)
-    model = QwenLayer()
-    data, gates, output = torch.zeros(8, 2), torch.zeros(8, 1), torch.zeros(8, 1, 2)
-    model._forward_core(data, gates, gates, output)
-    full_graph.assert_called_once_with(data, gates, gates, output, metadata)
-    baseline.assert_not_called()
-    decode.assert_not_called()
-
-
-def test_full_graph_core_passes_whole_capacity_and_device_state_flags(monkeypatch):
-    path = Path(__file__).resolve().parents[4] / "vllm_ascend/ops/gdn.py"
-    tree = ast.parse(path.read_text())
-    method = next(
-        node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "_forward_full_graph"
-    )
-    model = layer()
-    conv = Mock(side_effect=lambda output, data, *args, **kwargs: output.copy_(data))
-    monkeypatch.setattr(torch.ops._C_ascend, "npu_causal_conv1d_custom", conv, raising=False)
-    graph = Mock(side_effect=lambda q, k, v, g, beta, state, metadata, *, output: output.copy_(v + 7))
-    namespace = dict(
-        torch=torch,
-        PAD_SLOT_ID=-1,
-        chunk_gated_delta_rule_graph=graph,
-        DeviceOperator=SimpleNamespace(fused_gdn_gating=lambda log, a, b, bias: (a.unsqueeze(0), b.unsqueeze(0))),
-    )
-    exec(compile(ast.Module(body=[method], type_ignores=[]), str(path), "exec"), namespace)
-    metadata = SimpleNamespace(
-        query_start_loc=torch.tensor([0, 1, 4, 6, 6]),
-        state_write_indices=torch.tensor([2, 0, 1, -1]),
-        has_initial_state=torch.tensor([True, False, True, False]),
-    )
-    data, gates, output = torch.arange(16).reshape(8, 2).float(), torch.zeros(8, 1), torch.zeros(8, 1, 2)
-    namespace["_forward_full_graph"](model, data, gates, gates, output, metadata)
-    assert conv.call_args.kwargs["run_mode"] == 0
-    assert conv.call_args.kwargs["query_start_loc_opt"] is metadata.query_start_loc
-    assert conv.call_args.kwargs["initial_state_mode_opt"] is metadata.has_initial_state
-    assert graph.call_args.args[-1] is metadata
-    assert graph.call_args.args[0].shape == (1, 8, 1, 2)
-    torch.testing.assert_close(output[:, 0], data + 7)
+    cases = [
+        ([61], 0),
+        ([17, 44], 0),
+        ([1, 1, 59], 2),
+        ([1] * 63 + [137], 63),
+        ([1] * 63 + [65], 63),
+        ([1, 767], 1),
+        ([7], 0),
+    ]
+    for iteration, (lengths, num_decodes) in enumerate(cases):
+        baseline.reset_mock()
+        decode.reset_mock()
+        actual = sum(lengths)
+        capacity = next(size for size in (64, 128, 256, 768) if actual <= size)
+        inputs = torch.arange(capacity * 2).reshape(capacity, 2).float()
+        inputs[actual:] = float("nan")
+        output = torch.zeros(capacity, 1, 2)
+        slots = torch.arange(len(lengths) - 1, -1, -1) + iteration % 3
+        flags = (torch.arange(len(lengths)) + iteration) % 2 == 0
+        flags[:num_decodes] = True
+        cu = torch.tensor([0, *torch.tensor(lengths).cumsum(0).tolist()])
+        prefill_cu = cu[num_decodes:] - num_decodes
+        metadata = SimpleNamespace(
+            spec_sequence_masks=None,
+            spec_token_indx=None,
+            non_spec_token_indx=None,
+            spec_state_indices_tensor=None,
+            non_spec_state_indices_tensor=slots,
+            num_actual_tokens=actual,
+            num_decodes=num_decodes,
+            num_prefills=len(lengths) - num_decodes,
+            num_decode_tokens=num_decodes,
+            non_spec_prefill_metadata=SimpleNamespace(
+                causal_conv1d=SimpleNamespace(query_start_loc=cu, cache_indices=slots, initial_state_mode=flags),
+                chunk=SimpleNamespace(fresh_prefill=not flags[num_decodes:].any()),
+            ),
+            non_spec_decode_metadata=SimpleNamespace(actual_seq_lengths=cu[: num_decodes + 1]),
+            prefill_query_start_loc=prefill_cu,
+            prefill_state_indices=slots[num_decodes:],
+            prefill_has_initial_state=flags[num_decodes:],
+        )
+        context.attn_metadata["gdn"] = metadata
+        before = model.kv_cache[1].clone()
+        core(model, inputs, torch.zeros(capacity, 1), torch.zeros(capacity, 1), output)
+        baseline.assert_called_once()
+        call = baseline.call_args.kwargs
+        assert call["prebuilt_meta"] is metadata.non_spec_prefill_metadata.chunk
+        torch.testing.assert_close(call["cu_seqlens"], prefill_cu)
+        torch.testing.assert_close(call["v"][0, :, 0], inputs[num_decodes:actual])
+        initial = before[slots[num_decodes:]].transpose(-1, -2).contiguous()
+        initial.masked_fill_(~flags[num_decodes:, None, None, None], 0)
+        torch.testing.assert_close(call["initial_state"], initial)
+        expected_state = before.clone()
+        expected_state[slots[num_decodes:]] = (initial + 5).transpose(-1, -2)
+        torch.testing.assert_close(model.kv_cache[1], expected_state)
+        torch.testing.assert_close(output[num_decodes:actual, 0], inputs[num_decodes:actual] + 10)
+        if num_decodes:
+            torch.testing.assert_close(decode.call_args.kwargs["ssm_state_indices"], slots[:num_decodes])
+            torch.testing.assert_close(output[:num_decodes, 0], inputs[:num_decodes] + 20)
+        else:
+            decode.assert_not_called()
+        assert output[actual:].eq(0).all()
