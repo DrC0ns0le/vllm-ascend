@@ -225,4 +225,7 @@ if is_310p():
 else:
     _GDN_PATCH_TARGET.forward = AscendGatedDeltaNetAttention.forward
     _GDN_PATCH_TARGET._forward_core = AscendGatedDeltaNetAttention._forward_core
+    # Qwen's layer does not inherit the Ascend class, so install the helper
+    # called by _forward_core for graph-owned packed metadata as well.
+    _GDN_PATCH_TARGET._forward_full_graph = AscendGatedDeltaNetAttention._forward_full_graph
     _GDN_PATCH_TARGET._warmup_prefill_kernels = AscendGatedDeltaNetAttention._warmup_prefill_kernels

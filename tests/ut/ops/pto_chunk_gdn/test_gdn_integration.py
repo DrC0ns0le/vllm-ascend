@@ -254,16 +254,38 @@ def test_full_prefill_captures_baseline_even_when_megagdn_is_enabled(monkeypatch
     torch.testing.assert_close(model.kv_cache[1][1], expected + 5)
 
 
-def test_capacity_metadata_dispatches_before_host_prefill_decode_splitting(monkeypatch):
+def test_capacity_metadata_dispatches_through_patched_qwen_layer(monkeypatch):
     context = SimpleNamespace(attn_metadata={})
     core, baseline, decode = load_core(context, monkeypatch, [])
     metadata = core.__globals__["GDNFullGraphMetadata"]()
     context.attn_metadata["gdn"] = metadata
-    model = layer()
-    model._forward_full_graph = Mock()
+
+    # Qwen's class is patched, not derived from the Ascend implementation.
+    # Execute the production patch bindings rather than manually supplying
+    # the missing helper on the layer (which hid this startup regression).
+    class QwenLayer:
+        prefix = "gdn"
+
+    full_graph = Mock()
+    ascend = SimpleNamespace(
+        _forward_core=core,
+        _forward_full_graph=full_graph,
+        forward=Mock(),
+        _warmup_prefill_kernels=Mock(),
+    )
+    path = Path(__file__).resolve().parents[4] / "vllm_ascend/patch/worker/patch_qwen3_5.py"
+    tree = ast.parse(path.read_text())
+    hardware_patch = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.If) and isinstance(node.test, ast.Call) and ast.unparse(node.test.func) == "is_310p"
+    )
+    namespace = dict(_GDN_PATCH_TARGET=QwenLayer, AscendGatedDeltaNetAttention=ascend, is_310p=lambda: False)
+    exec(compile(ast.Module(body=[hardware_patch], type_ignores=[]), str(path), "exec"), namespace)
+    model = QwenLayer()
     data, gates, output = torch.zeros(8, 2), torch.zeros(8, 1), torch.zeros(8, 1, 2)
-    core(model, data, gates, gates, output)
-    model._forward_full_graph.assert_called_once_with(data, gates, gates, output, metadata)
+    model._forward_core(data, gates, gates, output)
+    full_graph.assert_called_once_with(data, gates, gates, output, metadata)
     baseline.assert_not_called()
     decode.assert_not_called()
 
