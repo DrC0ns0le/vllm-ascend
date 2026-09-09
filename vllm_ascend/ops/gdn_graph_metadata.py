@@ -20,6 +20,8 @@ class GDNFullGraphMetadata:
     chunk_offsets: torch.Tensor
     solve_indices: torch.Tensor
     cumsum_indices: torch.Tensor
+    recurrent_work: torch.Tensor
+    single_token_work: torch.Tensor
 
     @property
     def request_capacity(self):

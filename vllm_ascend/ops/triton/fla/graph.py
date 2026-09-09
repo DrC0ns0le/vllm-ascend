@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Device-metadata baseline GDN for whole-model mixed graph capture.
 
-All launch sizes depend on tensor capacity, never current request lengths.
-The existing chunk kernels do the arithmetic; an empty sentinel sequence
-makes excess tasks inert. Read/write anchors are explicit so the state
-interface does not assume that future checkpoint caches update in place.
+Launch sizes depend on tensor capacity or a fixed worker count, never current
+request lengths. An empty sentinel sequence makes excess preprocessing tasks
+inert; a compact device queue schedules the fused state/output stage. Read/write
+anchors are explicit so future checkpoint caches need not update in place.
 """
 
 import torch
@@ -12,9 +12,8 @@ from vllm.triton_utils import tl, triton
 
 from vllm_ascend.ops.gdn_graph_metadata import GDN_GRAPH_HEAD_DIM, GDNFullGraphMetadata
 
-from .chunk_delta_h import chunk_gated_delta_rule_fwd_h
-from .chunk_o import chunk_fwd_o
 from .chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
+from .chunk_state_output import chunk_state_output
 from .cumsum import chunk_local_cumsum
 from .l2norm import l2norm_fwd
 from .single_token import single_token_gdn
@@ -41,6 +40,8 @@ def _chunk_metadata_kernel(
     solve_indices,
     cumsum_indices,
     offsets,
+    recurrent_work,
+    single_token_work,
     count,
     N: tl.constexpr,
     CHUNK_CAPACITY: tl.constexpr,
@@ -68,6 +69,14 @@ def _chunk_metadata_kernel(
         tl.store(read_indices + seq, slots, seq < N)
         tl.store(write_indices + seq, slots, seq < N)
         tl.store(target_flags + seq, initial, seq < N)
+        active = (ends - starts > 1) & (slots >= 0) & (seq < count)
+        position = tl.cumsum(active.to(tl.int32), 0)
+        tl.store(recurrent_work, tl.sum(active.to(tl.int32), 0))
+        tl.store(recurrent_work + position, seq, active)
+        single = (ends - starts == 1) & (slots >= 0) & (seq < count)
+        position = tl.cumsum(single.to(tl.int32), 0)
+        tl.store(single_token_work, tl.sum(single.to(tl.int32), 0))
+        tl.store(single_token_work + position, seq, single)
     task = tl.program_id(0) * BC + tl.arange(0, BC)
     # Read the original boundaries for every table. No program consumes
     # another program's writes, so fusion needs no cross-core barrier.
@@ -118,6 +127,8 @@ def allocate_graph_metadata(token_capacity, request_capacity, num_heads, device)
         chunk_offsets=torch.empty(rows + 1, dtype=torch.int32, device=device),
         solve_indices=indices(SOLVE_BLOCK_SIZE),
         cumsum_indices=indices(cumsum_block_size(num_heads)),
+        recurrent_work=torch.empty(rows + 1, dtype=torch.int32, device=device),
+        single_token_work=torch.empty(rows + 1, dtype=torch.int32, device=device),
     )
 
 
@@ -147,6 +158,8 @@ def update_graph_metadata(
         target.solve_indices,
         target.cumsum_indices,
         target.chunk_offsets,
+        target.recurrent_work,
+        target.single_token_work,
         count,
         N=rows,
         CHUNK_CAPACITY=target.chunk_indices.shape[0],
@@ -242,30 +255,13 @@ def chunk_gated_delta_rule_graph(q, k, v, g, beta, state, metadata, *, output=No
         output_dtype=k.dtype,
     )
     w, u = recompute_w_u_fwd(k, v, beta, g, A, cu_seqlens=cu, chunk_indices=metadata.chunk_indices)
-    h, v_new, _ = chunk_gated_delta_rule_fwd_h(
+    return chunk_state_output(
+        q,
         k,
         w,
         u,
         g,
-        output_final_state=True,
-        cu_seqlens=cu,
-        chunk_indices=metadata.chunk_indices,
-        chunk_offsets=metadata.chunk_offsets,
-        skip_single_token=True,
-        state_cache=state,
-        state_metadata=metadata,
-        token_major_g=True,
+        state,
+        metadata,
+        output,
     )
-    output = chunk_fwd_o(
-        q,
-        k,
-        v_new,
-        h,
-        g,
-        cu_seqlens=cu,
-        chunk_offsets=metadata.chunk_offsets,
-        output=output,
-        skip_single_token=True,
-        token_major_g=True,
-    )
-    return output

@@ -321,15 +321,15 @@ the AscendC stages that require host query/chunk attributes. Empty sentinel
 sequences make unused chunk tasks inert, and padded requests never write state.
 
 Within this graph, device query lengths select a direct recurrent GDN kernel
-for single-token requests, including fresh requests. These rows bypass the
-prefill chunk tables; longer requests retain the chunked path. The chunk
-recurrence reads and writes the strided recurrent cache directly using device
-state indices and initial-state predicates. It no longer gathers/scatters
-packed initial/final states, and its state/output stages read the original
-gate layout without two additional contiguous copies per layer.
-Both paths are captured together and write disjoint rows, so
-changing the decode/prefill mix does not require a new graph specialization.
-The latency effect of these changes still requires NPU measurement.
+for single-token rows. Both routes use compact device work queues; multi-token rows use
+a fused state/output kernel. A fixed set of workers processes only live
+multi-token requests, keeps recurrent state within the kernel, and writes
+directly to physical SSM cache slots. The graph does not materialize packed
+initial/final states, per-chunk hidden-state snapshots, or `v_new` between
+the state and output stages. Fresh first chunks skip `W @ H` and `Q @ H`.
+The two paths write disjoint rows; changing the decode/prefill mix does not
+require a new graph specialization. The fused kernel preserves BF16 products
+and FP32 recurrence rather than enabling the fresh-only FP16 PTO MegaGDN path.
 
 Both ACL wrappers consult the shared native prefill dispatcher before normal
 graph dispatch. An outer ACL wrapper reuses an existing native wrapper's
@@ -337,14 +337,18 @@ sealed registry. With debug logging enabled, `FULL prefill replay hit` records
 the bucket, sealed status, and entry count for actual replay calls.
 
 Metadata refresh uses one device launch per shared GDN metadata group for
-query boundaries, state slots, initial-state flags, and all three chunk tables.
-FIA query boundaries, KV slots, and block tables are also refreshed in one
-launch per shared attention metadata group. Request count and live token count
+query boundaries, state slots, initial-state flags, both compact work
+queues, and all three chunk tables. Attention query boundaries, device KV
+lengths, KV slots, and block tables are also refreshed in one launch per
+shared attention metadata group. Request count and live token count
 are runtime scalars, so arrivals and ragged continuation chunks do not create
 new metadata-kernel specializations. This replaces eight tensor operations and
-three GDN metadata launches, plus seven FIA buffer operations; it does not
-remove FIA's per-layer host task updates or the replay synchronization they
-currently require. Latency improvements still need measurement on Ascend.
+three GDN metadata launches, plus seven FIA buffer operations. Capacity
+attention now reads these device buffers directly, so capacity entries do not
+allocate FIA task-update handles, external events, or an update stream. The
+serving path no longer synchronizes the current stream before each capacity
+replay. Copies, metadata refresh, and replay remain ordered on the request
+stream. Capture and graph destruction still synchronize where required.
 The standard builder's CPU sequence-length fields share one persistent tensor,
 avoiding a duplicate host tensor allocation and copy on each refresh.
 
@@ -354,13 +358,21 @@ not just the maximum length of one prompt. In particular, prompts shorter
 than 768 tokens can collectively fill a larger bucket under concurrent load.
 The default scheduler and aggregate capture sizes are unchanged.
 
-FIA query and KV lengths are refreshed through the existing attention
-task-update API. A dummy sequence consumes token padding; its output is
-discarded and its KV slots are `-1`. Both real and dummy block-table rows
-have graph-owned storage. Each
-entry owns its attention handles, events, workspaces, and metadata/table
-buffers; entries cannot overwrite decode's graph parameters or another
-prefill layout's handles at the same token count.
+Capacity attention uses a persistent Triton paged causal-attention kernel
+with device query lengths, KV lengths, and block tables. It supports matching
+FP16/BF16 query and KV tensors, GQA, sliding-window attention, and cache head
+dimensions 64, 128, or 256. Empty request rows and token padding do not create
+attention work; padded KV slots remain `-1`. Legacy layout-specialized FIA
+entries retain their private task-update handles and events. Standard decode
+graphs retain their existing implementation.
+
+These replacements target the measured replay host waits and GDN state/output
+cost; they are not a measured latency result. CPU numerical and dispatch tests
+cannot establish Ascend compilation, device accuracy, or speed. The NPU tests
+in `tests/ut/ops/a2/test_gdn_full_graph.py` and
+`tests/ut/ops/a2/test_graph_attention.py` exercise compilation and repeated
+graph replay with reference outputs. Real-weight mixed-serving accuracy and
+profiling on 910B remain required before claiming the regression is resolved.
 
 Replay copies current tokens, positions, KV slots, and recurrent-state indices
 into private graph buffers. On a mixed/stateful cache miss, active convolution

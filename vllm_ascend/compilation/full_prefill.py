@@ -293,7 +293,9 @@ class FullPrefillGraphCache:
         if capacity_signature is None and any(item.num_prefills <= 0 for item in context.attn_metadata.values()):
             return False, None
         inputs = (args, kwargs) if capacity_signature is not None else (args, kwargs, context.attn_metadata)
-        update_attention = capacity_signature is not None or self._updates_attention(context.attn_metadata)
+        # Capacity attention reads graph-owned device lengths. Only the
+        # legacy host-attribute FIA path needs task updates and replay waits.
+        update_attention = capacity_signature is None and self._updates_attention(context.attn_metadata)
         sources = []
         try:
             signature, _ = _flatten(inputs, sources, {}, update_attention=update_attention)

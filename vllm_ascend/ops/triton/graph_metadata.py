@@ -14,6 +14,8 @@ def _refresh_attention_metadata_kernel(
     target_query_starts,
     target_slots,
     target_blocks,
+    lengths,
+    target_lengths,
     count,
     actual,
     TOKENS: tl.constexpr,
@@ -24,6 +26,7 @@ def _refresh_attention_metadata_kernel(
     SLOT_STRIDE: tl.constexpr,
     BLOCK_ROW_STRIDE: tl.constexpr,
     BLOCK_COLUMN_STRIDE: tl.constexpr,
+    LENGTH_STRIDE: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     x = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
@@ -41,12 +44,17 @@ def _refresh_attention_metadata_kernel(
         other=0,
     )
     tl.store(target_blocks + x, block, x < ROWS * COLUMNS)
+    length = tl.load(lengths + x * LENGTH_STRIDE, x < count, other=0)
+    tl.store(target_lengths + x, length, x < ROWS)
 
 
 def refresh_attention_metadata(target, source, count, actual):
     rows, columns = target.block_tables.shape
     tokens = target.slot_mapping.shape[0]
     size = max(tokens, rows * columns, rows + 1)
+    lengths = getattr(source, "seq_lens_device", None)
+    if lengths is None:
+        lengths = source.seq_lens.to(source.query_start_loc.device)
     _refresh_attention_metadata_kernel[(triton.cdiv(size, METADATA_BLOCK_SIZE),)](
         source.query_start_loc,
         source.slot_mapping,
@@ -54,6 +62,8 @@ def refresh_attention_metadata(target, source, count, actual):
         target.query_start_loc,
         target.slot_mapping,
         target.block_tables,
+        lengths,
+        target.seq_lens_device,
         count,
         actual,
         TOKENS=tokens,
@@ -64,6 +74,7 @@ def refresh_attention_metadata(target, source, count, actual):
         SLOT_STRIDE=source.slot_mapping.stride(0),
         BLOCK_ROW_STRIDE=source.block_tables.stride(0),
         BLOCK_COLUMN_STRIDE=source.block_tables.stride(1),
+        LENGTH_STRIDE=lengths.stride(0),
         BLOCK=METADATA_BLOCK_SIZE,
         num_warps=4,
     )

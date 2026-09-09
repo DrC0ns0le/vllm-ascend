@@ -108,6 +108,7 @@ class FullGraphMetadataAdapter:
                 target.block_tables = source.block_tables.new_zeros((rows, spec[3]))
                 target.slot_mapping = source.slot_mapping.new_full((self.tokens,), -1)
                 target.seq_lens = source.seq_lens.new_zeros(rows)
+                target.seq_lens_device = source.query_start_loc.new_zeros(rows)
                 # The standard Ascend builder supplies host sequence lengths.
                 # Share their graph-owned buffer instead of constructing and
                 # copying a second CPU tensor on every metadata refresh.

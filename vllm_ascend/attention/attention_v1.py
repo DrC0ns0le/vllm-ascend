@@ -62,6 +62,7 @@ from vllm_ascend.compilation.acl_graph import (
 )
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.memcache_comm_fence import record_attention_compute_start
+from vllm_ascend.ops.triton.graph_attention import graph_paged_attention
 from vllm_ascend.utils import is_950, weak_ref_tensors
 
 # default max value of sliding window size
@@ -202,6 +203,7 @@ class AscendMetadata:
     # Native mixed graphs pass padded Q/K/V and mark inactive KV slots -1.
     # Keep num_actual_tokens as the scheduler's live count for bookkeeping.
     full_graph_token_capacity: int = 0
+    seq_lens_device: torch.Tensor | None = None
 
 
 class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
@@ -383,6 +385,7 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
             query_start_loc=query_start_loc,
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens,
+            seq_lens_device=common_attn_metadata.seq_lens[:num_reqs],
             seq_lens_list=seq_lens_list,
             max_query_len=common_attn_metadata.max_query_len,
             actual_seq_lengths_q=actual_seq_lengths_q,
@@ -1287,6 +1290,19 @@ class AscendAttentionBackendImpl(AttentionImpl):
         output: torch.Tensor,
         kv_cache=None,
     ):
+        if getattr(attn_metadata, "full_graph_token_capacity", 0):
+            # Capacity metadata is entirely device-resident. Capture this
+            # kernel directly, without FIA task groups or ExternalEvents.
+            return graph_paged_attention(
+                query,
+                self.key_cache,
+                self.value_cache,
+                attn_metadata,
+                output,
+                num_heads=self.num_heads,
+                scale=self.scale,
+                sliding_window=self.sliding_window,
+            )
         # we inherit ForwardContext in model runner v2, when enable model
         # runner v2, there is not capturing attribute in forward_context,
         # just use getattr to avoid attribute error.

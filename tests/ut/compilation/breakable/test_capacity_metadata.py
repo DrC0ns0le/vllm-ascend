@@ -86,6 +86,10 @@ class TensorLanguage:
     exp = staticmethod(torch.exp)
     zeros = staticmethod(torch.zeros)
     make_block_ptr = BlockPointer
+    minimum = staticmethod(lambda x, y: torch.minimum(torch.as_tensor(x), torch.as_tensor(y)))
+    maximum = staticmethod(lambda x, y: torch.maximum(torch.as_tensor(x), torch.as_tensor(y)))
+    max = staticmethod(torch.amax)
+    full = staticmethod(torch.full)
     dot = staticmethod(lambda a, b, **kwargs: a.float() @ b.float())
 
     def __init__(self):
@@ -123,6 +127,7 @@ class Launch:
         def run(*args, **kwargs):
             kwargs.pop("num_warps", None)
             kwargs.pop("num_stages", None)
+            kwargs.pop("multibuffer", None)
             for first in range(grid[0]):
                 for second in range(grid[1] if len(grid) > 1 else 1):
                     self.tl.program = first, second
@@ -167,7 +172,9 @@ def graph_code():
     namespace["_state_transfer_kernel"] = Launch(namespace["_state_transfer_kernel"], tl)
     namespace["VALUE_TILE"] = 32
     load_source(
-        "vllm_ascend/ops/triton/fla/single_token.py", {"_single_token_gdn_kernel", "single_token_gdn"}, namespace
+        "vllm_ascend/ops/triton/fla/single_token.py",
+        {"_single_token_gdn_kernel", "single_token_gdn", "SINGLE_TOKEN_PROGRAMS"},
+        namespace,
     )
     namespace["_single_token_gdn_kernel"] = Launch(namespace["_single_token_gdn_kernel"], tl)
     return namespace
@@ -376,6 +383,7 @@ def test_adapter_reuses_capacity_across_request_arrivals_lengths_and_classificat
         target.block_tables.data_ptr(),
         target.slot_mapping.data_ptr(),
         target.seq_lens.data_ptr(),
+        target.seq_lens_device.data_ptr(),
         adapter.metadata["gdn"].query_start_loc.data_ptr(),
     )
     for lengths in ([1, 193], [1, 1, 63, 127], [128], [256]):
@@ -384,6 +392,7 @@ def test_adapter_reuses_capacity_across_request_arrivals_lengths_and_classificat
         storage = torch.full((len(lengths), 2), -99, dtype=seq_dtype)
         storage[:, 0] = source.seq_lens
         source.seq_lens = storage[:, 0]
+        source.seq_lens_device = source.seq_lens  # Exercise strided device lengths too.
         assert code["capacity_metadata_signature"](context, config) == signature
         adapter.update(context.attn_metadata)
         count, actual = len(lengths), sum(lengths)
@@ -393,6 +402,7 @@ def test_adapter_reuses_capacity_across_request_arrivals_lengths_and_classificat
         assert target.seq_lens.tolist() == target.seq_lens_cpu.tolist() == expected_lengths
         assert target.seq_lens_cpu is target.seq_lens
         assert target.seq_lens.dtype == seq_dtype
+        assert target.seq_lens_device.tolist() == source.seq_lens.tolist() + [0] * (5 - count)
         assert target.attn_state == AttentionState.ChunkedPrefill
         assert target.full_graph_token_capacity == 256
         assert target.num_actual_tokens == actual
@@ -402,6 +412,7 @@ def test_adapter_reuses_capacity_across_request_arrivals_lengths_and_classificat
             target.block_tables.data_ptr(),
             target.slot_mapping.data_ptr(),
             target.seq_lens.data_ptr(),
+            target.seq_lens_device.data_ptr(),
             adapter.metadata["gdn"].query_start_loc.data_ptr(),
         )
 
@@ -592,6 +603,9 @@ def test_production_cache_captures_once_across_fresh_stateful_and_mixed_layouts(
     assert len(captures) == len(cache.entries) == 1
     assert len(replays) == 5
     assert all(entry is captures[0] for entry in replays)
+    assert captures[0].graph_params is None
+    assert sync.call_count == 1  # Capture warmup only; never a serving replay wait.
+    namespace["AscendAttentionBackendImpl"].update_graph_params.assert_not_called()
     if full_only:
         with pytest.raises(RuntimeError, match="not captured at startup"):
             cache.run(context, (torch.zeros(257),), {}, runnable=Mock(), capture=Mock(), replay=Mock())
@@ -729,8 +743,7 @@ def test_packed_graph_uses_direct_state_without_staging_or_gate_layout_copies():
         solve_indices=object(),
         chunk_offsets=object(),
     )
-    h_stage = Mock(return_value=(tensor, tensor, state))
-    o_stage = Mock(return_value=tensor)
+    fused_stage = Mock(return_value=tensor)
     namespace = dict(
         GDN_GRAPH_HEAD_DIM=128,
         CHUNK_SIZE=64,
@@ -740,8 +753,7 @@ def test_packed_graph_uses_direct_state_without_staging_or_gate_layout_copies():
         chunk_scaled_dot_kkt_fwd=Mock(return_value=tensor),
         solve_tril=Mock(return_value=tensor),
         recompute_w_u_fwd=Mock(return_value=(tensor, tensor)),
-        chunk_gated_delta_rule_fwd_h=h_stage,
-        chunk_fwd_o=o_stage,
+        chunk_state_output=fused_stage,
         transfer_state=Mock(side_effect=AssertionError("FULL must not stage recurrent state")),
         torch=SimpleNamespace(empty=Mock(side_effect=AssertionError("FULL must not allocate packed states"))),
     )
@@ -750,9 +762,7 @@ def test_packed_graph_uses_direct_state_without_staging_or_gate_layout_copies():
         namespace["chunk_gated_delta_rule_graph"](tensor, tensor, tensor, tensor, tensor, state, meta, output=tensor)
         is tensor
     )
-    assert h_stage.call_args.kwargs["state_cache"] is state
-    assert h_stage.call_args.kwargs["state_metadata"] is meta
-    assert h_stage.call_args.kwargs["token_major_g"] and o_stage.call_args.kwargs["token_major_g"]
+    assert fused_stage.call_args.args[-3:] == (state, meta, tensor)
     namespace["transfer_state"].assert_not_called()
 
 
@@ -809,7 +819,7 @@ def test_chunk_state_launcher_bounds_direct_tile_and_disables_multibuffering(dir
 @pytest.mark.parametrize("requests", [2, 3, 4, 8, 16, 32, 64])
 @pytest.mark.parametrize("cache_dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("split_single_token", [False, True])
-@pytest.mark.parametrize("direct_state", [False, True])
+@pytest.mark.parametrize("direct_state", [False, True, "fused"])
 def test_triton_state_and_output_stages_match_recurrence_with_nan_padding(
     graph_code, requests, cache_dtype, split_single_token, direct_state, monkeypatch
 ):
@@ -817,6 +827,10 @@ def test_triton_state_and_output_stages_match_recurrence_with_nan_padding(
     # Many decodes coexist with a continuing partial prefill and a fresh
     # prefill. At concurrency two, use one decode and one fresh prefill.
     lengths = [1, 65] if requests == 2 else [1] * (requests - 2) + [63, 65]
+    if requests == 3:
+        lengths[-1] = 767  # Continuation spans many recurrent chunks.
+    elif requests == 8:
+        lengths = [2, 3, 4, 7, 31, 61, 63, 65]  # Concurrent prefills, no decode-only majority.
     heads, key_heads, dim = 2, 1, 128
     total = sum(lengths)
     capacity = math.ceil((total + 1) / 64) * 64
@@ -844,6 +858,12 @@ def test_triton_state_and_output_stages_match_recurrence_with_nan_padding(
         cache = cache.transpose(-1, -2)
     write_slots = slots + requests + 1 if direct_state and requests == 3 else slots
     meta.state_write_indices[:requests].copy_(write_slots)
+    expected_work = [row for row, length in enumerate(lengths) if length > 1]
+    assert meta.recurrent_work[0] == len(expected_work)
+    assert meta.recurrent_work[1 : 1 + len(expected_work)].tolist() == expected_work
+    expected_single = [row for row, length in enumerate(lengths) if length == 1]
+    assert meta.single_token_work[0] == len(expected_single)
+    assert meta.single_token_work[1 : 1 + len(expected_single)].tolist() == expected_single
     cache[slots[~flags]] = float("nan")
     cache[slots[~flags], :, :, : dim // 2] = float("inf")
     before = cache.clone()
@@ -886,7 +906,7 @@ def test_triton_state_and_output_stages_match_recurrence_with_nan_padding(
     q[:, total:] = k[:, total:] = float("nan")
     v[:, total:] = float("nan")
     output = torch.full_like(v, float("nan"))
-    if split_single_token:
+    if split_single_token or direct_state == "fused":
         graph_code["single_token_gdn"](q, k, v, g, beta, cache, meta, output)
     tl = TensorLanguage()
     if direct_state:
@@ -894,9 +914,11 @@ def test_triton_state_and_output_stages_match_recurrence_with_nan_padding(
 
         def check_state_load(pointer, mask=True, **kwargs):
             if pointer.tensor.data_ptr() == cache.untyped_storage().data_ptr():
-                request = tl.program[1] // heads
-                if not flags[request]:
-                    assert not torch.as_tensor(mask).any(), "Fresh requests must mask cache reads at the load"
+                offsets, selected = torch.broadcast_tensors(pointer.offset, torch.as_tensor(mask))
+                loaded_slots = offsets[selected] // cache.stride(0)
+                assert not torch.isin(loaded_slots, slots[~flags]).any(), (
+                    "Fresh requests must mask cache reads at the load"
+                )
             return load(pointer, mask, **kwargs)
 
         monkeypatch.setattr(tl, "load", check_state_load)
@@ -925,42 +947,53 @@ def test_triton_state_and_output_stages_match_recurrence_with_nan_padding(
     )
     value_tile = 32 if direct_state else 64
     value_programs = math.ceil(dim / value_tile) if direct_state else 1
-    Launch(namespace["chunk_gated_delta_rule_fwd_kernel_h_blockdim64"], tl)[(value_programs, (requests + 1) * heads)](
-        k=k,
-        v=u,
-        w=w,
-        v_new=v_new,
-        g=cumulative_g if direct_state else cumulative_g.transpose(1, 2).contiguous(),
-        h=h,
-        h0=cache if direct_state else initial,
-        ht=cache if direct_state else final,
-        h_update=None,
-        USE_INITIAL_STATE=True,
-        STORE_FINAL_STATE=True,
-        SAVE_NEW_VALUE=True,
-        DIRECT_STATE=direct_state,
-        BV=value_tile,
-        state_read_indices=meta.state_read_indices,
-        state_write_indices=meta.state_write_indices,
-        state_initial_flags=meta.has_initial_state.to(torch.int8),
-        STATE_N=cache.stride(0),
-        STATE_H=cache.stride(1),
-        STATE_V=cache.stride(2),
-        STATE_K=cache.stride(3),
-        **common,
-    )
-    Launch(namespace["chunk_fwd_kernel_o"], tl)[(1, (requests + 1) * heads)](
-        q=q,
-        k=k,
-        v=v_new,
-        h=h,
-        g=cumulative_g if direct_state else cumulative_g.transpose(1, 2).contiguous(),
-        o=output,
-        scale=dim**-0.5,
-        BK=128,
-        BV=128,
-        **common,
-    )
+    if direct_state == "fused":
+        load_source(
+            "vllm_ascend/ops/triton/fla/chunk_state_output.py",
+            {"_chunk_state_output_kernel", "chunk_state_output", "STATE_OUTPUT_PROGRAMS", "STATE_OUTPUT_VALUE_TILE"},
+            namespace,
+        )
+        namespace["_chunk_state_output_kernel"] = Launch(namespace["_chunk_state_output_kernel"], tl)
+        namespace["chunk_state_output"](q, k, w, u, cumulative_g, cache, meta, output)
+    else:
+        Launch(namespace["chunk_gated_delta_rule_fwd_kernel_h_blockdim64"], tl)[
+            (value_programs, (requests + 1) * heads)
+        ](
+            k=k,
+            v=u,
+            w=w,
+            v_new=v_new,
+            g=cumulative_g if direct_state else cumulative_g.transpose(1, 2).contiguous(),
+            h=h,
+            h0=cache if direct_state else initial,
+            ht=cache if direct_state else final,
+            h_update=None,
+            USE_INITIAL_STATE=True,
+            STORE_FINAL_STATE=True,
+            SAVE_NEW_VALUE=True,
+            DIRECT_STATE=direct_state,
+            BV=value_tile,
+            state_read_indices=meta.state_read_indices,
+            state_write_indices=meta.state_write_indices,
+            state_initial_flags=meta.has_initial_state.to(torch.int8),
+            STATE_N=cache.stride(0),
+            STATE_H=cache.stride(1),
+            STATE_V=cache.stride(2),
+            STATE_K=cache.stride(3),
+            **common,
+        )
+        Launch(namespace["chunk_fwd_kernel_o"], tl)[(1, (requests + 1) * heads)](
+            q=q,
+            k=k,
+            v=v_new,
+            h=h,
+            g=cumulative_g if direct_state else cumulative_g.transpose(1, 2).contiguous(),
+            o=output,
+            scale=dim**-0.5,
+            BK=128,
+            BV=128,
+            **common,
+        )
     if not direct_state:
         torch.testing.assert_close(final[:requests][chunk_rows], expected_state[chunk_rows], atol=0.025, rtol=0.025)
     torch.testing.assert_close(output[:, :total].float(), expected_output, atol=0.01, rtol=0.025)
