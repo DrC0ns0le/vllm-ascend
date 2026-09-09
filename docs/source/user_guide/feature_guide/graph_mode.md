@@ -277,8 +277,39 @@ validation of this prefill path is still required.
 
 This path requires TP/PP/DP/PCP/DCP size 1, `mamba_cache_mode="none"`, and no
 speculative decoding, LoRA, KV transfer, C8 attention, attention sinks, or ENPU.
-Keep the existing `FULL_AND_PIECEWISE` configuration:
-the wrapper selects FULL prefill capture from eligible PIECEWISE dispatches.
+Use `FULL` for execution without PIECEWISE/eager fallback. The runner pads
+each scheduled batch to the next token capacity and captures all retained
+capacities at startup. It adds `max_num_batched_tokens` as the final ceiling,
+so coverage does not end at the last configured capture size. Standard FULL
+decode captures remain separate and cover every request count up to
+`max_num_seqs`.
+
+For example:
+
+```bash
+VLLM_USE_BREAKABLE_CUDAGRAPH=1 vllm serve /path/to/Qwen3.5-2B \
+  --max-num-seqs 64 \
+  --max-model-len 1536 \
+  --max-num-batched-tokens 4096 \
+  --compilation-config '{"cudagraph_mode":"FULL","cudagraph_capture_sizes":[1,64,128,196,256,384,512,768,1024,1536,2048,3172,4096]}'
+```
+
+Capacities describe aggregate scheduled tokens, not individual prompt lengths.
+Two decodes plus 137-token and 220-token prefills total 359 tokens and use a
+384-token capture. The 25 padding tokens cannot write KV or recurrent state.
+Larger arrivals are handled by the existing scheduler and chunked prefill;
+no extra batching layer is introduced.
+
+Startup warmup uses distinct recurrent slots, restores their state afterward,
+and captures both token-ID and embedding inputs when applicable. Captures must
+contain exactly one graph with no eager breaks. Serving then only replays:
+an unsupported configuration or an uncaptured input signature raises an error
+instead of silently changing execution mode. Startup profiling and warmup
+execute before serving; they are not request-time eager fallbacks.
+
+`FULL_AND_PIECEWISE` retains the earlier compatibility behavior: the wrapper
+selects FULL prefill capture from eligible PIECEWISE dispatches and permits
+fallback for unsupported layouts.
 
 For the target 128-dimension GDN model, prefill graphs specialize on the
 **token bucket**, with request capacity fixed to `max_num_seqs` (up to 64).
@@ -307,7 +338,7 @@ currently require. Latency improvements still need measurement on Ascend.
 The standard builder's CPU sequence-length fields share one persistent tensor,
 avoiding a duplicate host tensor allocation and copy on each refresh.
 
-For short prompts and outputs, the first use of a token bucket still pays
+With `FULL_AND_PIECEWISE`, the first use of a token bucket still pays
 lazy capture cost. Warmup should cover the aggregate batch token buckets,
 not just the maximum length of one prompt. In particular, prompts shorter
 than 768 tokens can collectively fill a larger bucket under concurrent load.
@@ -327,7 +358,15 @@ and SSM rows are saved on device and restored after warmup and capture. The
 first replay advances the existing state exactly once. These temporary copies
 are released after capture; steady replay uses the normal GDN state cache.
 
-The default capacity cache has room for every configured token bucket
+In `FULL`, `full_prefill_graph_max_entries` limits the number of prefill token
+capacities. A smaller limit coarsens the capacities and increases padding;
+it never reduces token coverage or evicts a graph during serving. A limit of
+one uses the scheduler ceiling for all prefills/mixed batches; zero is rejected.
+Without an explicit limit, every configured capacity up to the scheduler
+budget is retained, together with that budget's ceiling. Graph memory and
+startup time increase with the number of retained capacities and input forms.
+
+In `FULL_AND_PIECEWISE`, the default capacity cache has room for every configured token bucket
 (at least 8 entries). Unsupported geometries retain the earlier
 layout-specialized path, limited to 8 entries by default. New entries beyond
 the configured limit use PIECEWISE without evicting existing graphs.

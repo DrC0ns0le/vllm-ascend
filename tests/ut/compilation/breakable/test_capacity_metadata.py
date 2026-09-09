@@ -477,9 +477,11 @@ class Descriptor:
 class Mode(Enum):
     PIECEWISE = 0
     FULL = 1
+    NONE = 2
 
 
-def test_production_cache_captures_once_across_fresh_stateful_and_mixed_layouts(adapter_code, monkeypatch):
+@pytest.mark.parametrize("full_only", [False, True])
+def test_production_cache_captures_once_across_fresh_stateful_and_mixed_layouts(adapter_code, monkeypatch, full_only):
     sync = Mock()
     monkeypatch.setattr(
         torch,
@@ -533,6 +535,7 @@ def test_production_cache_captures_once_across_fresh_stateful_and_mixed_layouts(
         lora_config=None,
         model_config=SimpleNamespace(enforce_eager=False),
     )
+    config.compilation_config = SimpleNamespace(cudagraph_mode=Mode.FULL if full_only else Mode.PIECEWISE)
     cache = namespace["FullPrefillGraphCache"](config)
     captures, replays = [], []
     model_layers = live_context([64]).no_compile_layers
@@ -545,7 +548,8 @@ def test_production_cache_captures_once_across_fresh_stateful_and_mixed_layouts(
     ):
         context = live_context(lengths, fresh=fresh)
         context.batch_descriptor = Descriptor()
-        context.cudagraph_runtime_mode, context.capturing = Mode.PIECEWISE, False
+        runtime_mode = Mode.FULL if full_only else Mode.PIECEWISE
+        context.cudagraph_runtime_mode, context.capturing = runtime_mode, False
         context.no_compile_layers = model_layers
         gdn = context.attn_metadata["gdn"]
         if lengths == [1, 1]:
@@ -577,10 +581,15 @@ def test_production_cache_captures_once_across_fresh_stateful_and_mixed_layouts(
             True,
             "result",
         )
-        assert context.attn_metadata is live_metadata and context.cudagraph_runtime_mode == Mode.PIECEWISE
+        assert context.attn_metadata is live_metadata and context.cudagraph_runtime_mode == runtime_mode
+        if full_only:
+            cache.seal()
     assert len(captures) == len(cache.entries) == 1
     assert len(replays) == 5
     assert all(entry is captures[0] for entry in replays)
+    if full_only:
+        with pytest.raises(RuntimeError, match="not captured at startup"):
+            cache.run(context, (torch.zeros(257),), {}, runnable=Mock(), capture=Mock(), replay=Mock())
 
 
 @pytest.mark.parametrize("output_dtype", [torch.float32, torch.bfloat16])

@@ -68,6 +68,22 @@ class BreakableACLGraphWrapper(BreakableCUDAGraphWrapper):
             )
             if handled:
                 return output
+            context = get_forward_context()
+            if (
+                self.full_prefill.full_only
+                and context.attn_metadata is not None
+                and not getattr(context, "in_profile_run", False)
+                and (self.full_prefill.sealed or context.cudagraph_runtime_mode == CUDAGraphMode.FULL)
+            ):
+                has_gdn = isinstance(context.attn_metadata, dict) and any(
+                    type(metadata).__name__ == "GDNAttentionMetadata" for metadata in context.attn_metadata.values()
+                )
+                if context.cudagraph_runtime_mode != CUDAGraphMode.FULL or (
+                    has_gdn and not getattr(context.batch_descriptor, "uniform", False)
+                ):
+                    raise RuntimeError("FULL execution cannot fall back to PIECEWISE or eager")
+                if self.full_prefill.sealed and context.batch_descriptor not in self.entries:
+                    raise RuntimeError("FULL decode graph was not captured at startup")
         return super().__call__(*args, **kwargs)
 
     def clear_graphs(self):
@@ -119,6 +135,9 @@ class BreakableACLGraphWrapper(BreakableCUDAGraphWrapper):
             if not getattr(forward_context, "full_prefill_graph", False):
                 weak_ref_workspaces(get_draft_graph_params())
                 weak_ref_workspaces(get_draft_graph_prefill_params())
+
+        if self.full_prefill.full_only and (entry.capture.num_graphs != 1 or entry.capture.num_eager_breaks != 0):
+            raise RuntimeError("FULL capture must contain exactly one graph and no eager breaks")
 
         # Keep capturing=True on a successful FULL capture until the caller
         # finishes: MRV1 uses it to skip replay-only attention parameter updates.

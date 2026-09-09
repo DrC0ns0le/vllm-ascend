@@ -63,7 +63,9 @@ def wrapper_module(monkeypatch):
             get_draft_graph_prefill_params=lambda: "prefill",
             weak_ref_workspaces=lambda p: events.append(p),
         ),
-        "vllm_ascend.compilation.full_prefill": dict(FullPrefillGraphCache=lambda config: Mock()),
+        "vllm_ascend.compilation.full_prefill": dict(
+            FullPrefillGraphCache=lambda config: Mock(full_only=False, sealed=False)
+        ),
     }
     for name, attributes in modules.items():
         module = ModuleType(name)
@@ -126,6 +128,32 @@ def test_prefill_cache_dispatches_before_existing_wrapper(wrapper_module, handle
     assert wrapper() == ("prefill result" if handled else "existing result")
     wrapper.full_prefill.run.assert_called_once()
     assert events == ([] if handled else ["existing path"])
+
+
+@pytest.mark.parametrize("mode_name,uniform", [("PIECEWISE", False), ("FULL", False)])
+def test_full_only_never_enters_existing_fallback(wrapper_module, mode_name, uniform):
+    module, context, mode, events = wrapper_module
+    context.cudagraph_runtime_mode = mode[mode_name]
+    context.attn_metadata = {"gdn": type("GDNAttentionMetadata", (), {})()}
+    context.batch_descriptor = SimpleNamespace(uniform=uniform)
+    wrapper = module.BreakableACLGraphWrapper(Mock(), None)
+    wrapper.full_prefill.full_only = True
+    wrapper.full_prefill.sealed = True
+    wrapper.full_prefill.run.return_value = False, None
+    with pytest.raises(RuntimeError, match="cannot fall back"):
+        wrapper()
+    assert not events
+
+
+def test_full_only_retains_standard_uniform_decode(wrapper_module):
+    module, context, _, events = wrapper_module
+    context.attn_metadata = {"gdn": object()}
+    context.batch_descriptor = SimpleNamespace(uniform=True)
+    wrapper = module.BreakableACLGraphWrapper(Mock(), None)
+    wrapper.full_prefill.full_only = True
+    wrapper.full_prefill.run.return_value = False, None
+    assert wrapper() == "existing result"
+    assert events == ["existing path"]
 
 
 def test_capture_failure_restores_flag(wrapper_module):

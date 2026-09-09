@@ -148,10 +148,11 @@ def _restore_recurrent_states(snapshots):
 
 
 class FullPrefillGraphCache:
-    """Bounded cache; additional_config.full_prefill_graph_max_entries=0 disables it.
+    """Native graph cache with startup admission in FULL-only mode.
 
-    Once full, new layouts continue through PIECEWISE rather than evicting
-    graphs whose buffers could still be in use by asynchronous execution.
+    FULL_AND_PIECEWISE permits disabling the cache or falling back when its
+    entry limit is reached. FULL seals warmed capacities before serving and
+    rejects misses without evicting graphs or changing execution mode.
     """
 
     def __init__(self, config):
@@ -175,6 +176,10 @@ class FullPrefillGraphCache:
             self.enabled = "910B" in torch.npu.get_device_name()
         self.entries = {}
         self.config = config
+        self.full_only = (
+            getattr(getattr(config, "compilation_config", None), "cudagraph_mode", None) == CUDAGraphMode.FULL
+        )
+        self.sealed = False
         self.update_stream = None
         self.capture_stream = None
         # Capacity graphs need at most one entry per configured token bucket.
@@ -188,9 +193,22 @@ class FullPrefillGraphCache:
             # Complete queued replays before releasing their private metadata.
             torch.npu.current_stream().synchronize()
             self.entries.clear()
+        self.sealed = self.full_only
+
+    def begin_capture(self):
+        self.sealed = False
+
+    def seal(self):
+        """Finish startup admission; serving may only replay existing graphs."""
+        if self.full_only and not self.entries:
+            raise RuntimeError("FULL startup did not capture any native prefill graphs")
+        self.sealed = True
 
     def _eligible(self, context):
-        if not self.enabled or context.cudagraph_runtime_mode != CUDAGraphMode.PIECEWISE:
+        allowed_mode = context.cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE or (
+            self.full_only and context.cudagraph_runtime_mode == CUDAGraphMode.FULL
+        )
+        if not self.enabled or not allowed_mode:
             return False
         if context.batch_descriptor is None or context.batch_descriptor.has_lora:
             return False
@@ -253,9 +271,25 @@ class FullPrefillGraphCache:
         )
 
     def run(self, context, args, kwargs, *, runnable, capture, replay):
+        if getattr(context, "in_profile_run", False) or (
+            self.full_only and not self.sealed and context.cudagraph_runtime_mode == CUDAGraphMode.NONE
+        ):
+            return False, None
+        required = (
+            self.full_only
+            and isinstance(context.attn_metadata, dict)
+            and any(
+                type(item).__name__ == "GDNAttentionMetadata" and item.num_prefills > 0
+                for item in context.attn_metadata.values()
+            )
+        )
         if not self._eligible(context):
+            if required:
+                raise RuntimeError("FULL prefill rejected unsupported topology, cache mode, or GDN metadata")
             return False, None
         capacity_signature = capacity_metadata_signature(context, self.config)
+        if required and capacity_signature is None:
+            raise RuntimeError("FULL requires capacity-based GDN/FIA metadata; layout-specialized fallback is disabled")
         if capacity_signature is None and any(item.num_prefills <= 0 for item in context.attn_metadata.values()):
             return False, None
         inputs = (args, kwargs) if capacity_signature is not None else (args, kwargs, context.attn_metadata)
@@ -264,14 +298,20 @@ class FullPrefillGraphCache:
         try:
             signature, _ = _flatten(inputs, sources, {}, update_attention=update_attention)
         except TypeError as exc:
+            if required:
+                raise RuntimeError("FULL model inputs cannot be captured") from exc
             logger.debug("FULL prefill metadata not supported: %s", exc)
             return False, None
         # Capacity entries exclude live request metadata from this key. The
         # legacy route still specializes every host launch dimension.
         key = context.batch_descriptor, capacity_signature, update_attention, signature
         entry = self.entries.get(key)
+        if required and entry is None and self.sealed:
+            raise RuntimeError(
+                f"FULL serving encountered an input signature not captured at startup: {context.batch_descriptor}"
+            )
         limit = self.max_entries if capacity_signature is None else self.capacity_max_entries
-        if entry is None and len(self.entries) >= limit:
+        if not required and entry is None and len(self.entries) >= limit:
             logger.debug("FULL prefill graph cache at capacity: entries=%d", len(self.entries))
             return False, None
 
@@ -371,7 +411,7 @@ class FullPrefillGraphCache:
                 context.capturing = False
                 # Replay waits on the captured ExternalEvents. Updates must
                 # be submitted on a separate stream, after replay submission,
-                # before returning to MRV1 (whose dispatch is still PIECEWISE).
+                # before returning to MRV1.
                 for num_tokens in entry.graph_params.attn_params:
                     AscendAttentionBackendImpl.update_graph_params(
                         self.update_stream,
