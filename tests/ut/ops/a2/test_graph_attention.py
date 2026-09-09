@@ -7,13 +7,15 @@ import pytest
 import torch
 
 from vllm_ascend.ops.triton.graph_attention import graph_paged_attention
+from vllm_ascend.ops.triton.graph_metadata import allocate_attention_work, refresh_attention_metadata
 
 
 @pytest.mark.parametrize("dim", [128, 256])
 @pytest.mark.parametrize("window", [None, 32])
-def test_device_attention_replays_changing_mixed_lengths(dim, window):
+@pytest.mark.parametrize("block_size", [16, 96, 128])
+def test_device_attention_replays_changing_mixed_lengths(dim, window, block_size):
     torch.manual_seed(122)
-    capacity, rows, heads, key_heads, block_size, columns = 256, 64, 4, 2, 128, 6
+    capacity, rows, heads, key_heads, columns = 256, 64, 4, 2, (768 + block_size - 1) // block_size
     q = (torch.randn(capacity, heads, dim) * 0.2).bfloat16()
     k = torch.randn(rows * columns, block_size, key_heads, dim).bfloat16()
     v = torch.randn_like(k)
@@ -23,10 +25,22 @@ def test_device_attention_replays_changing_mixed_lengths(dim, window):
         query_start_loc=torch.zeros(rows + 2, dtype=torch.int64, device="npu"),
         seq_lens_device=torch.zeros(rows + 1, dtype=torch.int64, device="npu"),
         block_tables=torch.zeros(rows + 1, columns, dtype=torch.int32, device="npu"),
+        slot_mapping=torch.empty(capacity, dtype=torch.int64, device="npu"),
+        attention_work=allocate_attention_work(capacity, rows, "npu"),
     )
-    metadata.query_start_loc[1:] = 61
-    metadata.seq_lens_device[0] = 61
-    metadata.block_tables[:rows].copy_(blocks.to("npu"))
+    device_blocks = blocks.to("npu")
+
+    def update(cu, lens, count, actual):
+        source = SimpleNamespace(
+            query_start_loc=cu.to("npu"),
+            seq_lens_device=lens.to("npu"),
+            block_tables=device_blocks,
+            slot_mapping=torch.arange(actual, dtype=torch.int64, device="npu"),
+        )
+        refresh_attention_metadata(metadata, source, count, actual)
+
+    update(torch.tensor([0, 61]), torch.tensor([61]), 1, 61)
+    work_address = metadata.attention_work.data_ptr()
     output = torch.empty_like(qn)
 
     def run():
@@ -47,8 +61,8 @@ def test_device_attention_replays_changing_mixed_lengths(dim, window):
         lens = torch.tensor(
             [length + prefix for length, prefix in zip(lengths, prefixes)] + [0] * (rows + 1 - len(lengths))
         )
-        metadata.query_start_loc.copy_(cu.to("npu"))
-        metadata.seq_lens_device.copy_(lens.to("npu"))
+        update(cu, lens, len(lengths), sum(lengths))
+        assert metadata.attention_work.data_ptr() == work_address
         output.fill_(float("nan"))
         graph.replay()
         actual = output.cpu()

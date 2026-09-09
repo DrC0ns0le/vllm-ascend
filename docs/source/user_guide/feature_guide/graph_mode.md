@@ -361,8 +361,14 @@ The default scheduler and aggregate capture sizes are unchanged.
 Capacity attention uses a persistent Triton paged causal-attention kernel
 with device query lengths, KV lengths, and block tables. It supports matching
 FP16/BF16 query and KV tensors, GQA, sliding-window attention, and cache head
-dimensions 64, 128, or 256. Empty request rows and token padding do not create
-attention work; padded KV slots remain `-1`. Legacy layout-specialized FIA
+dimensions 64, 128, or 256 and cache page sizes divisible by 16. Query work
+is compacted once per shared metadata refresh into a graph-owned device table.
+Each attention K/V tile uses one scalar page lookup and stays within that page,
+keeping scans and page gathers out of the attention matmul kernel. This is a
+source workaround for the reported CANN 9.0.1 `llvm.func @malloc` lowering
+failure; successful compilation still needs confirmation on Ascend.
+Empty request rows and token padding do not create attention work;
+padded KV slots remain `-1`. Legacy layout-specialized FIA
 entries retain their private task-update handles and events. Standard decode
 graphs retain their existing implementation.
 

@@ -8,7 +8,7 @@ import torch
 
 from vllm_ascend.ops.gdn_graph_metadata import GDN_GRAPH_HEAD_DIM, MAX_GDN_GRAPH_HEADS
 from vllm_ascend.ops.triton.fla.graph import allocate_graph_metadata, update_graph_metadata
-from vllm_ascend.ops.triton.graph_metadata import refresh_attention_metadata
+from vllm_ascend.ops.triton.graph_metadata import allocate_attention_work, refresh_attention_metadata
 
 MAX_GRAPH_REQUESTS = 64
 FIA_CACHE_BLOCK_SIZE = 128
@@ -109,6 +109,9 @@ class FullGraphMetadataAdapter:
                 target.slot_mapping = source.slot_mapping.new_full((self.tokens,), -1)
                 target.seq_lens = source.seq_lens.new_zeros(rows)
                 target.seq_lens_device = source.query_start_loc.new_zeros(rows)
+                target.attention_work = allocate_attention_work(
+                    self.tokens, self.requests, source.query_start_loc.device
+                )
                 # The standard Ascend builder supplies host sequence lengths.
                 # Share their graph-owned buffer instead of constructing and
                 # copying a second CPU tensor on every metadata refresh.

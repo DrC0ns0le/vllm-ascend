@@ -339,10 +339,19 @@ def live_context(lengths, *, fresh=False):
 @pytest.fixture
 def adapter_code(graph_code):
     tl = TensorLanguage()
-    attention_code = dict(tl=tl, triton=SimpleNamespace(cdiv=tl.cdiv), METADATA_BLOCK_SIZE=256)
+    attention_code = dict(
+        tl=tl, torch=torch, triton=SimpleNamespace(cdiv=tl.cdiv, next_power_of_2=lambda n: 1 << (n - 1).bit_length())
+    )
     load_source(
         "vllm_ascend/ops/triton/graph_metadata.py",
-        {"_refresh_attention_metadata_kernel", "refresh_attention_metadata"},
+        {
+            "_refresh_attention_metadata_kernel",
+            "refresh_attention_metadata",
+            "allocate_attention_work",
+            "METADATA_BLOCK_SIZE",
+            "ATTENTION_QUERY_TILE",
+            "ATTENTION_WORK_BLOCK",
+        },
         attention_code,
     )
     attention_code["_refresh_attention_metadata_kernel"] = Launch(
@@ -359,6 +368,7 @@ def adapter_code(graph_code):
         allocate_graph_metadata=graph_code["allocate_graph_metadata"],
         update_graph_metadata=graph_code["update_graph_metadata"],
         refresh_attention_metadata=attention_code["refresh_attention_metadata"],
+        allocate_attention_work=attention_code["allocate_attention_work"],
     )
     return load_source(
         "vllm_ascend/compilation/full_graph_metadata.py",
@@ -384,6 +394,7 @@ def test_adapter_reuses_capacity_across_request_arrivals_lengths_and_classificat
         target.slot_mapping.data_ptr(),
         target.seq_lens.data_ptr(),
         target.seq_lens_device.data_ptr(),
+        target.attention_work.data_ptr(),
         adapter.metadata["gdn"].query_start_loc.data_ptr(),
     )
     for lengths in ([1, 193], [1, 1, 63, 127], [128], [256]):
@@ -413,6 +424,7 @@ def test_adapter_reuses_capacity_across_request_arrivals_lengths_and_classificat
             target.slot_mapping.data_ptr(),
             target.seq_lens.data_ptr(),
             target.seq_lens_device.data_ptr(),
+            target.attention_work.data_ptr(),
             adapter.metadata["gdn"].query_start_loc.data_ptr(),
         )
 

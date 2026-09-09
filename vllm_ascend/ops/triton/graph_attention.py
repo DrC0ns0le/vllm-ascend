@@ -6,12 +6,16 @@ tables. Query tiles are compacted on device; empty requests and token padding
 consume no attention tasks. This targets the small-context 910B FULL route.
 """
 
+from math import gcd
+
 import torch
 from vllm.triton_utils import tl, triton
 
+from .graph_metadata import ATTENTION_QUERY_TILE
+
 ATTENTION_PROGRAMS = 32
-QUERY_TILE = 16
 KEY_TILE = 64
+MIN_KEY_TILE = 16
 
 
 @triton.jit
@@ -22,6 +26,7 @@ def _graph_attention_kernel(
     cu,
     lengths,
     blocks,
+    work,
     output,
     H: tl.constexpr,
     HK: tl.constexpr,
@@ -42,45 +47,41 @@ def _graph_attention_kernel(
     OD: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     COLUMNS: tl.constexpr,
-    ROWS: tl.constexpr,
-    BR: tl.constexpr,
     BQ: tl.constexpr,
     BK: tl.constexpr,
     SCALE: tl.constexpr,
     WINDOW: tl.constexpr,
     PROGRAMS: tl.constexpr,
 ):
-    rows = tl.arange(0, BR)
-    starts = tl.load(cu + rows, rows < ROWS, other=0)
-    ends = tl.load(cu + rows + 1, rows < ROWS, other=0)
-    counts = tl.cdiv(ends - starts, BQ)
-    cumulative = tl.cumsum(counts, 0)
-    total = tl.sum(counts, 0)
+    total = tl.load(work)
     for task in range(tl.program_id(0), total * H, PROGRAMS):
         tile, head = task // H, task % H
-        row = tl.sum(((tile >= cumulative) & (rows < ROWS)).to(tl.int32), 0)
-        first_tile = tl.sum(tl.where(rows == row, cumulative - counts, 0), 0)
-        begin, end = tl.load(cu + row), tl.load(cu + row + 1)
-        qpos = (tile - first_tile) * BQ + tl.arange(0, BQ)
+        row = tl.load(work + (tile + 1) * 2)
+        query_offset = tl.load(work + (tile + 1) * 2 + 1)
+        begin, end = tl.load(cu + row).to(tl.int32), tl.load(cu + row + 1).to(tl.int32)
+        qpos = query_offset + tl.arange(0, BQ)
         qvalid = begin + qpos < end
-        kv_length = tl.load(lengths + row)
+        kv_length = tl.load(lengths + row).to(tl.int32)
         prefix = kv_length - (end - begin)
         dim = tl.arange(0, D)
         query = tl.load(q + (begin + qpos[:, None]) * QT + head * QH + dim[None, :] * QD, qvalid[:, None], other=0)
         acc = tl.zeros((BQ, D), dtype=tl.float32)
         maximum = tl.full((BQ,), -float("inf"), dtype=tl.float32)
         denominator = tl.zeros((BQ,), dtype=tl.float32)
-        limit = tl.minimum(kv_length, prefix + (tile - first_tile + 1) * BQ)
+        limit = tl.minimum(kv_length, prefix + query_offset + BQ)
         lower = 0
         if WINDOW > 0:
-            lower = tl.maximum(0, prefix + (tile - first_tile) * BQ - WINDOW + 1) // BK * BK
+            lower = tl.maximum(0, prefix + query_offset - WINDOW + 1) // BK * BK
         for base in range(lower, limit, BK):
             pos = base + tl.arange(0, BK)
-            block = tl.load(blocks + row * COLUMNS + pos // BLOCK_SIZE, pos < limit, other=0)
+            # BK divides the cache page size, so every tile belongs to one
+            # page. Use a scalar page base and affine tile offsets rather
+            # than a vector gather feeding the Cube/Vector matmul pipeline.
+            block = tl.load(blocks + row * COLUMNS + base // BLOCK_SIZE).to(tl.int64)
             valid = (pos < limit) & (block >= 0)
             kh = head // (H // HK)
             key = tl.load(
-                k + block[None, :] * KB + (pos[None, :] % BLOCK_SIZE) * KT + kh * KH + dim[:, None] * KD,
+                k + block * KB + (base % BLOCK_SIZE + tl.arange(0, BK)[None, :]) * KT + kh * KH + dim[:, None] * KD,
                 valid[None, :],
                 other=0,
             )
@@ -95,7 +96,7 @@ def _graph_attention_kernel(
             correction = tl.exp(maximum - safe_maximum)
             probability = tl.exp(scores - safe_maximum[:, None])
             value = tl.load(
-                v + block[:, None] * VB + (pos[:, None] % BLOCK_SIZE) * VT + kh * VH + dim[None, :] * VD,
+                v + block * VB + (base % BLOCK_SIZE + tl.arange(0, BK)[:, None]) * VT + kh * VH + dim[None, :] * VD,
                 valid[:, None],
                 other=0,
             )
@@ -113,9 +114,10 @@ def graph_paged_attention(query, key, value, metadata, output, *, num_heads, sca
         raise ValueError("Device FULL attention requires matching FP16/BF16 query and KV caches")
     if num_heads % key.shape[2]:
         raise ValueError("Device FULL attention requires an integral GQA head ratio")
+    if key.shape[1] <= 0 or key.shape[1] % MIN_KEY_TILE:
+        raise ValueError("Device FULL attention requires a cache page size divisible by 16")
     q = query.view(query.shape[0], num_heads, key.shape[-1])
     out = output.view_as(q)
-    rows = metadata.block_tables.shape[0] - 1  # Exclude the token-padding sentinel.
     _graph_attention_kernel[(ATTENTION_PROGRAMS,)](
         q,
         key,
@@ -123,6 +125,7 @@ def graph_paged_attention(query, key, value, metadata, output, *, num_heads, sca
         metadata.query_start_loc,
         metadata.seq_lens_device,
         metadata.block_tables,
+        metadata.attention_work,
         out,
         H=num_heads,
         HK=key.shape[2],
@@ -143,10 +146,8 @@ def graph_paged_attention(query, key, value, metadata, output, *, num_heads, sca
         OD=out.stride(2),
         BLOCK_SIZE=key.shape[1],
         COLUMNS=metadata.block_tables.shape[1],
-        ROWS=rows,
-        BR=triton.next_power_of_2(rows),
-        BQ=QUERY_TILE,
-        BK=KEY_TILE,
+        BQ=ATTENTION_QUERY_TILE,
+        BK=gcd(KEY_TILE, key.shape[1]),
         SCALE=scale,
         WINDOW=sliding_window or 0,
         PROGRAMS=ATTENTION_PROGRAMS,
