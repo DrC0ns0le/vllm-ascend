@@ -407,6 +407,12 @@ class FullPrefillGraphCache:
             # Execute even on a miss: serving must return the graph's output,
             # not depend on whether stream capture executes device work.
             result = replay(entry, static_args, static_kwargs)
+            logger.debug(
+                "FULL prefill replay hit: descriptor=%s sealed=%s entries=%d",
+                entry.batch_descriptor,
+                self.sealed,
+                len(self.entries),
+            )
             if entry.graph_params is not None:
                 context.capturing = False
                 # Replay waits on the captured ExternalEvents. Updates must

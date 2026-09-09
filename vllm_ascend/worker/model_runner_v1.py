@@ -5158,7 +5158,9 @@ class NPUModelRunner(GPUModelRunner):
         policy = self.full_graph_policy
         if policy is None:
             return
-        if not isinstance(self.model, BreakableACLGraphWrapper):
+        if not isinstance(self.model, BreakableACLGraphWrapper) and not isinstance(
+            getattr(self.model, "_full_prefill_wrapper", None), BreakableACLGraphWrapper
+        ):
             raise RuntimeError("Native FULL capture requires the breakable wrapper")
         # Standard decode capture can use another stream. Finish it before
         # borrowing and snapshotting any recurrent cache rows for warmup.

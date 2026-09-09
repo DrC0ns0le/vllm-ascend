@@ -196,7 +196,7 @@ def _state_transfer_kernel(
             data = tl.load(packed_ptr, mask, other=0)
             tl.store(cache_ptr, data, mask)
         else:
-            initial = tl.load(flags + row)
+            initial = tl.load(flags + row) != 0
             data = tl.load(cache_ptr, mask & initial, other=0)
             tl.store(packed_ptr, data, mask)
 
@@ -242,26 +242,30 @@ def chunk_gated_delta_rule_graph(q, k, v, g, beta, state, metadata, *, output=No
         output_dtype=k.dtype,
     )
     w, u = recompute_w_u_fwd(k, v, beta, g, A, cu_seqlens=cu, chunk_indices=metadata.chunk_indices)
-    initial = torch.empty(
-        (metadata.state_read_indices.shape[0], v.shape[2], k.shape[-1], v.shape[-1]),
-        dtype=state.dtype,
-        device=state.device,
-    )
-    transfer_state(state, initial, metadata, write=False, skip_single_token=True)
-    h, v_new, final = chunk_gated_delta_rule_fwd_h(
+    h, v_new, _ = chunk_gated_delta_rule_fwd_h(
         k,
         w,
         u,
         g,
-        initial,
         output_final_state=True,
         cu_seqlens=cu,
         chunk_indices=metadata.chunk_indices,
         chunk_offsets=metadata.chunk_offsets,
         skip_single_token=True,
+        state_cache=state,
+        state_metadata=metadata,
+        token_major_g=True,
     )
     output = chunk_fwd_o(
-        q, k, v_new, h, g, cu_seqlens=cu, chunk_offsets=metadata.chunk_offsets, output=output, skip_single_token=True
+        q,
+        k,
+        v_new,
+        h,
+        g,
+        cu_seqlens=cu,
+        chunk_offsets=metadata.chunk_offsets,
+        output=output,
+        skip_single_token=True,
+        token_major_g=True,
     )
-    transfer_state(state, final, metadata, write=True, skip_single_token=True)
     return output

@@ -322,9 +322,19 @@ sequences make unused chunk tasks inert, and padded requests never write state.
 
 Within this graph, device query lengths select a direct recurrent GDN kernel
 for single-token requests, including fresh requests. These rows bypass the
-prefill chunk tables and packed state copies; longer requests retain the
-chunked path. Both paths are captured together and write disjoint rows, so
+prefill chunk tables; longer requests retain the chunked path. The chunk
+recurrence reads and writes the strided recurrent cache directly using device
+state indices and initial-state predicates. It no longer gathers/scatters
+packed initial/final states, and its state/output stages read the original
+gate layout without two additional contiguous copies per layer.
+Both paths are captured together and write disjoint rows, so
 changing the decode/prefill mix does not require a new graph specialization.
+The latency effect of these changes still requires NPU measurement.
+
+Both ACL wrappers consult the shared native prefill dispatcher before normal
+graph dispatch. An outer ACL wrapper reuses an existing native wrapper's
+sealed registry. With debug logging enabled, `FULL prefill replay hit` records
+the bucket, sealed status, and entry count for actual replay calls.
 
 Metadata refresh uses one device launch per shared GDN metadata group for
 query boundaries, state slots, initial-state flags, and all three chunk tables.
@@ -399,6 +409,11 @@ NPU arithmetic, capture legality, and performance remain unvalidated.
 Single-token recurrence tests also cover 4, 10, and 64 consecutive updates
 with reordered requests, cache-slot reuse, grouped heads, and strided state
 and gate tensors, including exact preservation of inactive slots.
+Ascend compile/run regressions are in
+`tests/ut/ops/a2/test_gdn_full_graph.py`; they cover Boolean/byte predicates and
+direct cache access against staged recurrence. The real-weight startup test
+`tests/e2e/pull_request/one_card/aclgraph/test_qwen3_5_full_startup.py` also
+requires serving replay hits with an unchanged sealed registry.
 
 ## Common Limitations and Caveats
 

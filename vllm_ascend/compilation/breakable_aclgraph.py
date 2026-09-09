@@ -57,6 +57,13 @@ class BreakableACLGraphWrapper(BreakableCUDAGraphWrapper):
         self.full_prefill = FullPrefillGraphCache(vllm_config)
 
     def __call__(self, *args, **kwargs):
+        handled, output = self.try_full_prefill(args, kwargs)
+        if handled:
+            return output
+        return super().__call__(*args, **kwargs)
+
+    def try_full_prefill(self, args, kwargs, *, decode_entries=None):
+        """Shared admission/replay path, including when wrapped by ACLGraph."""
         if not self.enable_enpu and is_forward_context_available():
             handled, output = self.full_prefill.run(
                 get_forward_context(),
@@ -67,7 +74,7 @@ class BreakableACLGraphWrapper(BreakableCUDAGraphWrapper):
                 replay=self._replay,
             )
             if handled:
-                return output
+                return True, output
             context = get_forward_context()
             if (
                 self.full_prefill.full_only
@@ -82,9 +89,12 @@ class BreakableACLGraphWrapper(BreakableCUDAGraphWrapper):
                     has_gdn and not getattr(context.batch_descriptor, "uniform", False)
                 ):
                     raise RuntimeError("FULL execution cannot fall back to PIECEWISE or eager")
-                if self.full_prefill.sealed and context.batch_descriptor not in self.entries:
-                    raise RuntimeError("FULL decode graph was not captured at startup")
-        return super().__call__(*args, **kwargs)
+                if self.full_prefill.sealed:
+                    if decode_entries is None:
+                        decode_entries = self.entries
+                    if context.batch_descriptor not in decode_entries:
+                        raise RuntimeError("FULL decode graph was not captured at startup")
+        return False, None
 
     def clear_graphs(self):
         self.full_prefill.clear()

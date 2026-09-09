@@ -44,7 +44,7 @@ def _single_token_gdn_kernel(
             tile = tl.program_id(1) % tl.cdiv(V, BV)
             key = tl.arange(0, K)
             value = tile * BV + tl.arange(0, BV)
-            initial = tl.load(initial_flags + row)
+            initial = tl.load(initial_flags + row) != 0
             state_offset = head * STATE_H + key[:, None] * STATE_K + value[None, :] * STATE_V
             h = tl.load(state + read * STATE_N + state_offset, (value[None, :] < V) & initial, other=0).to(tl.float32)
             gate = tl.load(g + start * G_T + head * G_H).to(tl.float32)

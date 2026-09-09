@@ -44,10 +44,13 @@ def chunk_fwd_kernel_o(
     USE_G: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     SKIP_SINGLE_TOKEN: tl.constexpr = False,
+    G_TOKEN_STRIDE: tl.constexpr = 1,
+    G_HEAD_STRIDE: tl.constexpr = 0,
 ):
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_h = i_nh // H, i_nh % H
     T_max = T
+    g_head_stride = G_HEAD_STRIDE if G_HEAD_STRIDE else T_max
 
     if IS_VARLEN:
         bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
@@ -92,8 +95,8 @@ def chunk_fwd_kernel_o(
         if USE_G:
             offs_t = i_t * BT + tl.arange(0, BT)
             mask_t = offs_t < T
-            g_ptr = g + bos + i_h * T_max
-            b_g = tl.load(g_ptr + offs_t, mask=mask_t, other=0.0)
+            g_ptr = g + bos * G_TOKEN_STRIDE + i_h * g_head_stride
+            b_g = tl.load(g_ptr + offs_t * G_TOKEN_STRIDE, mask=mask_t, other=0.0)
 
             b_o = b_o * tl.exp(b_g)[:, None]
             b_A = b_A * safe_exp(b_g[:, None] - b_g[None, :])
@@ -124,6 +127,7 @@ def chunk_fwd_o(
     chunk_offsets: torch.Tensor | None = None,
     output: torch.Tensor | None = None,
     skip_single_token: bool = False,
+    token_major_g: bool = False,
 ) -> torch.Tensor:
     B, T, Hg, K, V = *q.shape, v.shape[-1]
     H = v.shape[-2]
@@ -143,7 +147,8 @@ def chunk_fwd_o(
     def grid(meta):
         return (triton.cdiv(V, meta["BV"]), N * H)
 
-    g = g.transpose(1, 2).contiguous()
+    if not token_major_g:
+        g = g.transpose(1, 2).contiguous()
     chunk_fwd_kernel_o[grid](
         q=q,
         k=k,
@@ -163,6 +168,8 @@ def chunk_fwd_o(
         BK=128,
         BV=128,
         SKIP_SINGLE_TOKEN=skip_single_token,
+        G_TOKEN_STRIDE=g.stride(1) if token_major_g else 1,
+        G_HEAD_STRIDE=g.stride(2) if token_major_g else 0,
         num_warps=4,
         num_stages=2,
     )

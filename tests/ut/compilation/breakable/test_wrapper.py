@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU contract tests; these do not substitute for ACLGraph hardware tests."""
 
+import ast
 import importlib.util
 import sys
 from enum import Enum
@@ -16,6 +17,7 @@ def wrapper_module(monkeypatch):
     events = []
 
     class Mode(Enum):
+        NONE = 0
         FULL = 1
         PIECEWISE = 2
 
@@ -154,6 +156,46 @@ def test_full_only_retains_standard_uniform_decode(wrapper_module):
     wrapper.full_prefill.run.return_value = False, None
     assert wrapper() == "existing result"
     assert events == ["existing path"]
+
+
+@pytest.mark.parametrize("reuse", [False, True])
+def test_outer_acl_wrapper_reuses_native_registry_before_ordinary_dispatch(wrapper_module, monkeypatch, reuse):
+    module, context, mode, events = wrapper_module
+    inner = module.BreakableACLGraphWrapper(Mock(), None)
+    inner.full_prefill.run.return_value = True, "native replay"
+    registry = inner.full_prefill
+    path = Path(__file__).resolve().parents[4] / "vllm_ascend/compilation/acl_graph.py"
+    tree = ast.parse(path.read_text())
+    cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "ACLGraphWrapper")
+    namespace = dict(
+        get_forward_context=Mock(side_effect=AssertionError("ordinary ACL path was entered")),
+        CUDAGraphMode=mode,
+        envs=SimpleNamespace(VLLM_LOGGING_LEVEL="INFO"),
+        current_platform=SimpleNamespace(get_global_graph_pool=lambda: None),
+        CUDAGraphOptions=SimpleNamespace,
+        check_gdn_layer=lambda config: True,
+        _acl_graph_wrappers=set(),
+    )
+    monkeypatch.setitem(sys.modules, "vllm_ascend.compilation.breakable_aclgraph", module)
+    definitions = [ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), cls]
+    exec(
+        compile(ast.fix_missing_locations(ast.Module(body=definitions, type_ignores=[])), str(path), "exec"), namespace
+    )
+    config = SimpleNamespace(compilation_config=SimpleNamespace(cudagraph_mode=mode.FULL))
+    outer = namespace["ACLGraphWrapper"](inner if reuse else inner.runnable, config, runtime_mode=mode.FULL)
+    if reuse:
+        assert outer._full_prefill_wrapper is inner and outer.full_prefill is registry
+    else:
+        inner = outer._full_prefill_wrapper
+        registry = inner.full_prefill
+        registry.run.return_value = True, "native replay"
+    assert outer("input") == "native replay"
+    assert inner.full_prefill is registry
+    registry.run.assert_called_once_with(
+        context, ("input",), {}, runnable=inner.runnable, capture=inner._capture, replay=inner._replay
+    )
+    inner.runnable.assert_not_called()
+    assert events == []
 
 
 def test_capture_failure_restores_flag(wrapper_module):
