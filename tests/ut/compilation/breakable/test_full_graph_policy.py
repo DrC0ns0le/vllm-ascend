@@ -325,6 +325,7 @@ def test_real_dummy_path_builds_fresh_metadata_before_full_capture(policy_class,
         assert tables[0].slot_mapping.gpu.eq(-1).all()
         metadata = type("AscendMetadata", (), {})()
         metadata.seq_lens = runner.optimistic_seq_lens_cpu[:rows]
+        metadata.seq_lens_cpu = metadata.seq_lens
         metadata.seq_lens_list = lengths.tolist()
         return {"attention": metadata}, None
 
@@ -333,6 +334,11 @@ def test_real_dummy_path_builds_fresh_metadata_before_full_capture(policy_class,
         assert kwargs["aclgraph_runtime_mode"] == Mode.FULL
         assert kwargs["batch_descriptor"] == Descriptor(capacity)
         assert metadata["attention"].seq_lens_list == [768] * rows
+        assert metadata["attention"].seq_lens.eq(768).all()
+        assert metadata["attention"].seq_lens_cpu is metadata["attention"].seq_lens
+        # The real builder aliases the pinned H2D source. Workspace sizing
+        # must not change it while the NPU copy may still be reading it.
+        torch.testing.assert_close(runner.optimistic_seq_lens_cpu[:rows], lengths)
         seen.append(capacity)
         yield
 

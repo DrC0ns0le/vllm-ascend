@@ -3532,7 +3532,11 @@ class NPUModelRunner(GPUModelRunner):
                     for metadata in attn_metadata.values():
                         if type(metadata).__name__ == "AscendMetadata" and id(metadata) not in seen:
                             seen.add(id(metadata))
-                            metadata.seq_lens.fill_(self.max_model_len)
+                            # The builder aliases optimistic_seq_lens_cpu,
+                            # which may still be an in-flight H2D source for
+                            # GDN. Size FIA workspaces using separate storage.
+                            metadata.seq_lens = metadata.seq_lens.new_full((num_reqs,), self.max_model_len)
+                            metadata.seq_lens_cpu = metadata.seq_lens
                             metadata.seq_lens_list[:] = [self.max_model_len] * num_reqs
         with self.maybe_dummy_run_with_lora(
             self.lora_config,
