@@ -29,6 +29,10 @@ def load_source(path, names, namespace):
             if isinstance(node, ast.FunctionDef):
                 node.decorator_list = []
             selected.append(node)
+        elif isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id in names for target in node.targets
+        ):
+            selected.append(node)
     module = ast.Module(
         body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), *selected],
         type_ignores=[],
@@ -752,12 +756,62 @@ def test_packed_graph_uses_direct_state_without_staging_or_gate_layout_copies():
     namespace["transfer_state"].assert_not_called()
 
 
+@pytest.mark.parametrize("direct", [False, True])
+def test_chunk_state_launcher_bounds_direct_tile_and_disables_multibuffering(direct):
+    captured = {}
+
+    class Kernel:
+        def __getitem__(self, grid):
+            def launch(**kwargs):
+                captured.update(kwargs)
+                captured["grid"] = grid(kwargs)
+
+            return launch
+
+    namespace = dict(
+        torch=torch,
+        triton=SimpleNamespace(cdiv=lambda x, y: (x + y - 1) // y),
+        chunk_gated_delta_rule_fwd_kernel_h_blockdim64=Kernel(),
+    )
+    load_source(
+        "vllm_ascend/ops/triton/fla/chunk_delta_h.py",
+        {"chunk_gated_delta_rule_fwd_h", "DIRECT_STATE_VALUE_TILE"},
+        namespace,
+    )
+    k = torch.empty(1, 128, 1, 128, dtype=torch.bfloat16)
+    w = u = torch.empty(1, 128, 2, 128, dtype=torch.bfloat16)
+    g = torch.empty(1, 128, 2)
+    state = torch.empty(6, 2, 128, 128)
+    metadata = SimpleNamespace(state_read_indices=object(), state_write_indices=object(), has_initial_state=object())
+    _, _, final = namespace["chunk_gated_delta_rule_fwd_h"](
+        k,
+        w,
+        u,
+        g,
+        output_final_state=True,
+        cu_seqlens=torch.tensor([0, 1, 4, 69, 69]),
+        chunk_indices=torch.empty(6, 2),
+        chunk_offsets=torch.empty(5),
+        state_cache=state if direct else None,
+        state_metadata=metadata if direct else None,
+        token_major_g=direct,
+    )
+    assert captured["grid"] == (4 if direct else 1, 8)
+    assert captured["BV"] == (32 if direct else 64)
+    assert captured["num_stages"] == (1 if direct else 2)
+    if direct:
+        assert captured["multibuffer"] is False
+        assert captured["h0"] is captured["ht"] is final is state
+    else:
+        assert "multibuffer" not in captured
+
+
 @pytest.mark.parametrize("requests", [2, 3, 4, 8, 16, 32, 64])
 @pytest.mark.parametrize("cache_dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("split_single_token", [False, True])
 @pytest.mark.parametrize("direct_state", [False, True])
 def test_triton_state_and_output_stages_match_recurrence_with_nan_padding(
-    graph_code, requests, cache_dtype, split_single_token, direct_state
+    graph_code, requests, cache_dtype, split_single_token, direct_state, monkeypatch
 ):
     torch.manual_seed(7)
     # Many decodes coexist with a continuing partial prefill and a fresh
@@ -791,6 +845,7 @@ def test_triton_state_and_output_stages_match_recurrence_with_nan_padding(
     write_slots = slots + requests + 1 if direct_state and requests == 3 else slots
     meta.state_write_indices[:requests].copy_(write_slots)
     cache[slots[~flags]] = float("nan")
+    cache[slots[~flags], :, :, : dim // 2] = float("inf")
     before = cache.clone()
     initial = torch.full((requests + 1, heads, dim, dim), float("nan"), dtype=cache_dtype)
     if not direct_state:
@@ -834,6 +889,17 @@ def test_triton_state_and_output_stages_match_recurrence_with_nan_padding(
     if split_single_token:
         graph_code["single_token_gdn"](q, k, v, g, beta, cache, meta, output)
     tl = TensorLanguage()
+    if direct_state:
+        load = tl.load
+
+        def check_state_load(pointer, mask=True, **kwargs):
+            if pointer.tensor.data_ptr() == cache.untyped_storage().data_ptr():
+                request = tl.program[1] // heads
+                if not flags[request]:
+                    assert not torch.as_tensor(mask).any(), "Fresh requests must mask cache reads at the load"
+            return load(pointer, mask, **kwargs)
+
+        monkeypatch.setattr(tl, "load", check_state_load)
     namespace = dict(tl=tl, safe_exp=lambda x: torch.where(x <= 0, x, -float("inf")).exp())
     load_source(
         "vllm_ascend/ops/triton/fla/chunk_delta_h.py", {"chunk_gated_delta_rule_fwd_kernel_h_blockdim64"}, namespace
@@ -857,7 +923,9 @@ def test_triton_state_and_output_stages_match_recurrence_with_nan_padding(
         G_TOKEN_STRIDE=cumulative_g.stride(1) if direct_state else 1,
         G_HEAD_STRIDE=cumulative_g.stride(2) if direct_state else 0,
     )
-    Launch(namespace["chunk_gated_delta_rule_fwd_kernel_h_blockdim64"], tl)[(1, (requests + 1) * heads)](
+    value_tile = 32 if direct_state else 64
+    value_programs = math.ceil(dim / value_tile) if direct_state else 1
+    Launch(namespace["chunk_gated_delta_rule_fwd_kernel_h_blockdim64"], tl)[(value_programs, (requests + 1) * heads)](
         k=k,
         v=u,
         w=w,
@@ -871,6 +939,7 @@ def test_triton_state_and_output_stages_match_recurrence_with_nan_padding(
         STORE_FINAL_STATE=True,
         SAVE_NEW_VALUE=True,
         DIRECT_STATE=direct_state,
+        BV=value_tile,
         state_read_indices=meta.state_read_indices,
         state_write_indices=meta.state_write_indices,
         state_initial_flags=meta.has_initial_state.to(torch.int8),

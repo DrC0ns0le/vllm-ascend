@@ -15,6 +15,9 @@ from vllm.triton_utils import tl, triton
 from .utils import prepare_chunk_indices, prepare_chunk_offsets, safe_exp
 
 _CONDITIONS = ("seq7168",)
+# One FP32 [128, 32] accumulator: 16 KiB before compiler temporaries,
+# instead of the two [128, 64] accumulators in the staged-state route.
+DIRECT_STATE_VALUE_TILE = 32
 
 
 @triton.heuristics(
@@ -61,6 +64,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     STATE_K: tl.constexpr = 0,
     G_TOKEN_STRIDE: tl.constexpr = 1,
     G_HEAD_STRIDE: tl.constexpr = 0,
+    BV: tl.constexpr = 64,
 ):
     i_nh = tl.program_id(1)
     i_n, i_h = i_nh // H, i_nh % H
@@ -85,31 +89,35 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     stride_k = Hg * K
     stride_w = H * K
 
-    b_h1_bv1 = tl.zeros([128, 64], dtype=tl.float32)
-    b_h1_bv2 = tl.zeros([128, 64], dtype=tl.float32)
-    # create b_hupd_bv1 and b_hupd_bv2
-
-    v_start1 = 0
-    v_start2 = 64
-
-    offs_k = tl.arange(0, 128)[:, None]
-    offs_v1 = v_start1 + tl.arange(0, 64)[None, :]
-    offs_v2 = v_start2 + tl.arange(0, 64)[None, :]
-    mask_kv1 = (offs_k < K) & (offs_v1 < V)
-    mask_kv2 = (offs_k < K) & (offs_v2 < V)
-
-    # load initial state
     if DIRECT_STATE:
         read = tl.load(state_read_indices + i_n)
         write = tl.load(state_write_indices + i_n)
         if (read < 0) | (write < 0):
             return
+
+    b_h1_bv1 = tl.zeros([128, BV], dtype=tl.float32)
+    v_start1 = tl.program_id(0) * BV if DIRECT_STATE else 0
+
+    offs_k = tl.arange(0, 128)[:, None]
+    offs_v1 = v_start1 + tl.arange(0, BV)[None, :]
+    mask_kv1 = (offs_k < K) & (offs_v1 < V)
+    if not DIRECT_STATE:
+        b_h1_bv2 = tl.zeros([128, 64], dtype=tl.float32)
+        v_start2 = 64
+        offs_v2 = v_start2 + tl.arange(0, 64)[None, :]
+        mask_kv2 = (offs_k < K) & (offs_v2 < V)
+
+    # load initial state
+    if DIRECT_STATE:
         initial = tl.load(state_initial_flags + i_n) != 0
         h0_ptr = h0 + read * STATE_N + i_h * STATE_H
         # Cache layout is [slot, head, value, key]. Read the transpose
         # directly into the recurrence's [key, value] accumulators.
-        b_h1_bv1 += tl.load(h0_ptr + offs_k * STATE_K + offs_v1 * STATE_V, mask_kv1 & initial, other=0).to(tl.float32)
-        b_h1_bv2 += tl.load(h0_ptr + offs_k * STATE_K + offs_v2 * STATE_V, mask_kv2 & initial, other=0).to(tl.float32)
+        # Fresh requests must suppress the cache read itself: selecting zero
+        # after an unmasked load produced incorrect results on Ascend.
+        b_h1_bv1 += tl.load(h0_ptr + offs_k * STATE_K + offs_v1 * STATE_V, mask=mask_kv1 & initial, other=0.0).to(
+            tl.float32
+        )
     elif USE_INITIAL_STATE:
         h0_ptr = h0 + i_nh * K * V
         ptr_h0_bv1 = h0_ptr + offs_k * V + offs_v1 * 1
@@ -122,11 +130,12 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     for i_t in range(NT):
         h_base = h + (boh + i_t) * H * K * V + i_h * K * V
 
-        p_h1_bv1 = tl.make_block_ptr(h_base, (K, V), (V, 1), (0, v_start1), (128, 64), (1, 0))
+        p_h1_bv1 = tl.make_block_ptr(h_base, (K, V), (V, 1), (0, v_start1), (128, BV), (1, 0))
         tl.store(p_h1_bv1, b_h1_bv1.to(p_h1_bv1.dtype.element_ty), boundary_check=(0, 1))
 
-        p_h1_bv2 = tl.make_block_ptr(h_base, (K, V), (V, 1), (0, v_start2), (128, 64), (1, 0))
-        tl.store(p_h1_bv2, b_h1_bv2.to(p_h1_bv2.dtype.element_ty), boundary_check=(0, 1))
+        if not DIRECT_STATE:
+            p_h1_bv2 = tl.make_block_ptr(h_base, (K, V), (V, 1), (0, v_start2), (128, 64), (1, 0))
+            tl.store(p_h1_bv2, b_h1_bv2.to(p_h1_bv2.dtype.element_ty), boundary_check=(0, 1))
 
         offs_t_wv = (i_t * BT + tl.arange(0, BT))[:, None]
         offs_k_wv = tl.arange(0, 128)[None, :]
@@ -163,7 +172,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
         b_v_new1 -= tl.dot(b_w, b_h1_bv1.to(b_w.dtype))
 
         if SAVE_NEW_VALUE:
-            p_v_new1 = tl.make_block_ptr(v_new_base, (T, V), (stride_v, 1), (i_t * BT, v_start1), (BT, 64), (1, 0))
+            p_v_new1 = tl.make_block_ptr(v_new_base, (T, V), (stride_v, 1), (i_t * BT, v_start1), (BT, BV), (1, 0))
             tl.store(p_v_new1, b_v_new1.to(p_v_new1.dtype.element_ty), boundary_check=(0, 1))
 
         if USE_G:
@@ -173,22 +182,23 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
         b_v_new1 = b_v_new1.to(k.dtype.element_ty)
         b_h1_bv1 += tl.dot(b_k, b_v_new1)
 
-        mask_v2 = (offs_t_v < T) & (offs_v2 < V)
-        ptr_v2 = v_base + offs_t_v * stride_v + offs_v2 * 1
-        b_v2 = tl.load(ptr_v2, mask=mask_v2, other=0.0)
-        b_v_new2 = b_v2.to(tl.float32)
-        b_v_new2 -= tl.dot(b_w, b_h1_bv2.to(b_w.dtype))
+        if not DIRECT_STATE:
+            mask_v2 = (offs_t_v < T) & (offs_v2 < V)
+            ptr_v2 = v_base + offs_t_v * stride_v + offs_v2 * 1
+            b_v2 = tl.load(ptr_v2, mask=mask_v2, other=0.0)
+            b_v_new2 = b_v2.to(tl.float32)
+            b_v_new2 -= tl.dot(b_w, b_h1_bv2.to(b_w.dtype))
 
-        if SAVE_NEW_VALUE:
-            p_v_new2 = tl.make_block_ptr(v_new_base, (T, V), (stride_v, 1), (i_t * BT, v_start2), (BT, 64), (1, 0))
-            tl.store(p_v_new2, b_v_new2.to(p_v_new2.dtype.element_ty), boundary_check=(0, 1))
+            if SAVE_NEW_VALUE:
+                p_v_new2 = tl.make_block_ptr(v_new_base, (T, V), (stride_v, 1), (i_t * BT, v_start2), (BT, 64), (1, 0))
+                tl.store(p_v_new2, b_v_new2.to(p_v_new2.dtype.element_ty), boundary_check=(0, 1))
 
-        if USE_G:
-            b_v_new2 = b_v_new2 * b_g[:, None]
-            b_h1_bv2 = b_h1_bv2 * b_g_last
+            if USE_G:
+                b_v_new2 = b_v_new2 * b_g[:, None]
+                b_h1_bv2 = b_h1_bv2 * b_g_last
 
-        b_v_new2 = b_v_new2.to(k.dtype.element_ty)
-        b_h1_bv2 += tl.dot(b_k, b_v_new2)
+            b_v_new2 = b_v_new2.to(k.dtype.element_ty)
+            b_h1_bv2 += tl.dot(b_k, b_v_new2)
 
     # epilogue
     if DIRECT_STATE:
@@ -196,7 +206,6 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
         # Each live request owns disjoint cache rows. Single-token rows
         # have already returned and are updated by single_token_gdn.
         tl.store(ht_ptr + offs_k * STATE_K + offs_v1 * STATE_V, b_h1_bv1, mask_kv1)
-        tl.store(ht_ptr + offs_k * STATE_K + offs_v2 * STATE_V, b_h1_bv2, mask_kv2)
     elif STORE_FINAL_STATE:
         ht_ptr = ht + i_nh * K * V
 
@@ -261,7 +270,11 @@ def chunk_gated_delta_rule_fwd_h(
         g = g.transpose(1, 2).contiguous()
 
     def grid(meta):
-        return (1, N * H)
+        return (triton.cdiv(V, DIRECT_STATE_VALUE_TILE) if direct_state else 1, N * H)
+
+    # The direct route keeps one small state tile live and disables Ascend
+    # ping-pong buffers. num_stages alone does not control that duplication.
+    compile_options = {"multibuffer": False} if direct_state else {}
 
     chunk_gated_delta_rule_fwd_kernel_h_blockdim64[grid](
         k=k,
@@ -292,7 +305,9 @@ def chunk_gated_delta_rule_fwd_h(
         STATE_K=state_cache.stride(3) if direct_state else 0,
         G_TOKEN_STRIDE=g.stride(1) if token_major_g else 1,
         G_HEAD_STRIDE=g.stride(2) if token_major_g else 0,
+        BV=DIRECT_STATE_VALUE_TILE if direct_state else 64,
         num_warps=4,
-        num_stages=2,
+        num_stages=1 if direct_state else 2,
+        **compile_options,
     )
     return h, v_new, final_state

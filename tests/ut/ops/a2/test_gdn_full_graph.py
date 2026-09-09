@@ -49,7 +49,8 @@ def test_single_token_gdn_compiles_predicate_masks_and_preserves_inactive_rows(f
 
 @pytest.mark.parametrize("cache_dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("strided_cache", [False, True])
-def test_chunk_recurrence_direct_cache_matches_staged_state(cache_dtype, strided_cache):
+@pytest.mark.parametrize("graph_replay", [False, True])
+def test_chunk_recurrence_direct_cache_matches_staged_state(cache_dtype, strided_cache, graph_replay):
     torch.manual_seed(37)
     capacity, heads, dim = 128, 2, 128
     metadata = allocate_graph_metadata(capacity, 3, heads, "npu")
@@ -63,6 +64,7 @@ def test_chunk_recurrence_direct_cache_matches_staged_state(cache_dtype, strided
     )
     cache = (torch.randn(6, heads, dim, dim) * 0.05).to(cache_dtype)
     cache[1] = float("nan")
+    cache[1, :, :, : dim // 2] = float("inf")
     if strided_cache:
         cache = cache.transpose(-1, -2)
     direct = cache.to("npu")
@@ -72,7 +74,6 @@ def test_chunk_recurrence_direct_cache_matches_staged_state(cache_dtype, strided
     u = torch.randn(1, capacity, heads, dim).bfloat16().to("npu")
     g = (-torch.rand(1, capacity, heads * 2) * 0.05).to("npu")[..., ::2]
     initial = torch.empty((4, heads, dim, dim), dtype=cache_dtype, device="npu")
-    transfer_state(staged, initial, metadata, write=False, skip_single_token=True)
     kwargs = dict(
         output_final_state=True,
         cu_seqlens=metadata.query_start_loc,
@@ -80,14 +81,39 @@ def test_chunk_recurrence_direct_cache_matches_staged_state(cache_dtype, strided
         chunk_offsets=metadata.chunk_offsets,
         skip_single_token=True,
     )
-    expected_h, expected_v, final = chunk_gated_delta_rule_fwd_h(k, w, u, g, initial, **kwargs)
-    transfer_state(staged, final, metadata, write=True, skip_single_token=True)
-    actual_h, actual_v, final_cache = chunk_gated_delta_rule_fwd_h(
-        k, w, u, g, state_cache=direct, state_metadata=metadata, token_major_g=True, **kwargs
-    )
-    assert final_cache is direct
-    torch.npu.synchronize()
-    torch.testing.assert_close(direct.cpu(), staged.cpu(), atol=1e-3, rtol=1e-2, equal_nan=True)
-    # Only three live chunks and tokens [1, 69) belong to the chunk route.
-    torch.testing.assert_close(actual_h[:, :3].cpu(), expected_h[:, :3].cpu(), atol=1e-3, rtol=1e-2)
-    torch.testing.assert_close(actual_v[:, 1:69].cpu(), expected_v[:, 1:69].cpu(), atol=1e-3, rtol=1e-2)
+
+    def run_direct():
+        return chunk_gated_delta_rule_fwd_h(
+            k, w, u, g, state_cache=direct, state_metadata=metadata, token_major_g=True, **kwargs
+        )
+
+    if graph_replay:
+        # Compile before capture, then restore state modified by warmup/capture.
+        run_direct()
+        torch.npu.synchronize()
+        graph = torch.npu.NPUGraph()
+        with torch.npu.graph(graph):
+            actual_h, actual_v, final_cache = run_direct()
+        direct.copy_(staged)
+
+    # Fresh -> continuation -> fresh slot reuse, without replacing graph inputs.
+    for flags in ([True, False, True], [True, True, True], [True, False, False]):
+        metadata.has_initial_state[:3].copy_(torch.tensor(flags, device="npu"))
+        for row, slot in enumerate((3, 1, 4)):
+            if not flags[row]:
+                for state in (direct, staged):
+                    state[slot] = float("nan")
+                    state[slot, :, :, : dim // 2] = float("inf")
+        transfer_state(staged, initial, metadata, write=False, skip_single_token=True)
+        expected_h, expected_v, final = chunk_gated_delta_rule_fwd_h(k, w, u, g, initial, **kwargs)
+        transfer_state(staged, final, metadata, write=True, skip_single_token=True)
+        if graph_replay:
+            graph.replay()
+        else:
+            actual_h, actual_v, final_cache = run_direct()
+        assert final_cache is direct
+        torch.npu.synchronize()
+        torch.testing.assert_close(direct.cpu(), staged.cpu(), atol=1e-3, rtol=1e-2, equal_nan=True)
+        # Only three live chunks and tokens [1, 69) belong to the chunk route.
+        torch.testing.assert_close(actual_h[:, :3].cpu(), expected_h[:, :3].cpu(), atol=1e-3, rtol=1e-2)
+        torch.testing.assert_close(actual_v[:, 1:69].cpu(), expected_v[:, 1:69].cpu(), atol=1e-3, rtol=1e-2)
