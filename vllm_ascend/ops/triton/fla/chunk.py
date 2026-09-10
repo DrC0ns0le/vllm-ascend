@@ -99,8 +99,8 @@ def chunk_gated_delta_rule_fwd(
         cu_seqlens_host = tuple(cu_seqlens.tolist())
     if chunk_indices_chunk64_host is None and chunk_indices is not None:
         chunk_indices_chunk64_host = tuple(chunk_indices.flatten().tolist())
-    # Compact zero-length segments for the AscendC kernels (see
-    # _compact_empty_segments).  chunk_indices_chunk64 is already compact-
+    # Compact zero-length segments using the CPU-built metadata for the
+    # AscendC kernels. chunk_indices_chunk64 is already compact-
     # ranked and is reused as-is; only cu_seqlens / initial_state need
     # compacting.
     if prebuilt_meta is not None and hasattr(prebuilt_meta, "keep_meta"):

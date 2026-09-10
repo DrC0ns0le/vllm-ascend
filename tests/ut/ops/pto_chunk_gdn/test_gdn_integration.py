@@ -157,6 +157,7 @@ def test_mixed_batch_only_sends_prefill_slice_and_rebased_state_to_backend(monke
         model.pto_gdn_backend = Mock(side_effect=lambda **kwargs: (kwargs["v"] + 10, kwargs["initial_state"] + 5))
     inputs = torch.arange(12).reshape(6, 2).float()
     output = torch.zeros(6, 1, 2)
+    monkeypatch.setattr(torch, "cat", lambda *args, **kwargs: pytest.fail("mixed output must use its final slices"))
     core(model, inputs, torch.zeros(6, 1), torch.zeros(6, 1), output)
     selected = model.pto_gdn_backend if enable_mega else baseline
     selected.assert_called_once()

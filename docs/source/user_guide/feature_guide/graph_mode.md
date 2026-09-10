@@ -320,6 +320,52 @@ the host overhead within that sequence. Ascend startup/replay accuracy and mixed
 serving latency must still be validated on hardware; CPU contract tests do not
 establish either accuracy or performance on NPU.
 
+### Investigating Qwen3.5 submission gaps
+
+Native GDN prefill builds its chunk tables from CPU request boundaries and uploads
+the tables together in one aligned allocation. Each step owns its allocation;
+an in-flight step never shares writable tables with a later step. Standard
+attention reuses the runner's uploaded query offsets. Mixed GDN batches write
+their decode and prefill outputs directly into the caller's output slices.
+These changes reduce preparation and copying without changing recurrent math
+or removing FULL replay synchronization.
+
+Compare against `9ec889975` using the same model, command, request sequence, and
+capture sizes. Measure latency with profiling and DEBUG logging off. Verify
+output correctness before comparing latency, including repeated requests,
+continuation chunks, and arrivals during decode. The changes have CPU contract
+coverage; NPU performance remains to be measured.
+
+Two further configuration comparisons can help isolate the remaining delay.
+Run them separately, changing only the indicated setting:
+
+| Comparison | Change | What it isolates |
+| --- | --- | --- |
+| Scheduler | Use `--no-async-scheduling` | Whether asynchronous step coordination contributes to latency. Throughput may decrease. |
+| Decode graph | Change `cudagraph_mode` from `FULL_AND_PIECEWISE` to `PIECEWISE` | Avoids the FULL decode update/replay path while preserving piecewise prefill. Decode submission work may increase. |
+
+For a separate short diagnostic profile, set
+`VLLM_CUSTOM_SCOPES_FOR_PROFILING=1` before server startup and use the existing
+torch NPU profiler configuration. No DEBUG logging is needed. New CPU ranges are:
+
+- `ascend::update_states` and `ascend::build_attention_metadata`
+- `ascend::model_execution` and `ascend::update_full_graph_params`
+- `ascend::full_replay_sync` for the FULL-only host barrier
+- `ascend::PIECEWISE::tokens=64::segment=0::graph` (or `eager`), with the actual
+  runtime mode, padded token count, and segment index in each label
+
+The segment ranges are nested inside model execution. Existing `prepare input`,
+`forward`, `post process`, and `sample_token` ranges locate them within a runner
+step. With custom scopes disabled, recorded segments keep their original
+callables. Profiling ranges measure host activity, not NPU completion; use the
+profiler's CPU/device correlations to locate device gaps. A kernel CSV's wait
+duration alone does not identify the host submission time or the waiting API.
+
+If only a text summary can be returned, include the replay mode and token bucket,
+counts and durations of the above ranges, unprofiled latency, and whether the
+largest gap is inside model execution, in input preparation, or between runner
+steps. This is enough to direct the next change without sharing a full trace.
+
 ## Common Limitations and Caveats
 
 - XliteGraph should be treated as an alternative graph path, not as a drop-in replacement for ACLGraph in all scenarios.

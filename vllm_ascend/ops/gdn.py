@@ -469,10 +469,13 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             )
             ssm_state[prefill_state_indices] = last_recurrent_state.transpose(-1, -2).contiguous().to(ssm_state.dtype)
             if split_non_spec:
-                core_attn_out_non_spec = torch.cat(
-                    [core_attn_out_decode, core_attn_out_non_spec],
-                    dim=1,
-                )
+                # Both slices already have the final packed order. Write into
+                # the caller-owned graph buffer instead of allocating a cat
+                # result and copying the entire mixed batch a second time.
+                core_attn_out[:num_decode_tokens] = core_attn_out_decode.squeeze(0)
+                core_attn_out[num_decode_tokens:num_actual_tokens] = core_attn_out_non_spec.squeeze(0)
+                maybe_save_kv_layer_to_connector("", [])
+                return
         elif attn_metadata.num_decodes > 0:
             actual_seq_lengths = attn_metadata.non_spec_decode_metadata.actual_seq_lengths
             query_non_spec = l2norm_fwd(query_non_spec)

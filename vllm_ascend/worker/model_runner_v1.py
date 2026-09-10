@@ -1902,9 +1902,10 @@ class NPUModelRunner(GPUModelRunner):
                             req_state.prev_num_draft_len = 0
 
                 # Update persistent batch states.
-                deferred_state_corrections_fn = self._update_states(
-                    scheduler_output
-                )
+                with record_function_or_nullcontext("ascend::update_states"):
+                    deferred_state_corrections_fn = self._update_states(
+                        scheduler_output
+                    )
 
                 if has_ec_transfer() and not get_ec_transfer().is_consumer:
                     self._start_dump_data()
@@ -2086,19 +2087,20 @@ class NPUModelRunner(GPUModelRunner):
                         batch_desc.num_reqs,
                     )
 
-                (attn_metadata, spec_decode_common_attn_metadata) = self._build_attention_metadata(
-                    num_tokens=num_tokens_unpadded,
-                    num_tokens_padded=num_tokens_padded,
-                    num_reqs=num_reqs,
-                    num_reqs_padded=num_reqs_padded,
-                    max_query_len=max_num_scheduled_tokens,
-                    ubatch_slices=ubatch_slices_attn,
-                    logits_indices=logits_indices,
-                    use_spec_decode=use_spec_decode,
-                    num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
-                    num_scheduled_tokens_np=num_scheduled_tokens_np,
-                    cascade_attn_prefix_lens=cascade_attn_prefix_lens,
-                )
+                with record_function_or_nullcontext("ascend::build_attention_metadata"):
+                    (attn_metadata, spec_decode_common_attn_metadata) = self._build_attention_metadata(
+                        num_tokens=num_tokens_unpadded,
+                        num_tokens_padded=num_tokens_padded,
+                        num_reqs=num_reqs,
+                        num_reqs_padded=num_reqs_padded,
+                        max_query_len=max_num_scheduled_tokens,
+                        ubatch_slices=ubatch_slices_attn,
+                        logits_indices=logits_indices,
+                        use_spec_decode=use_spec_decode,
+                        num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
+                        num_scheduled_tokens_np=num_scheduled_tokens_np,
+                        cascade_attn_prefix_lens=cascade_attn_prefix_lens,
+                    )
 
                 self._sanitize_placeholder_input_ids_for_forward(
                     scheduler_output,
@@ -2733,12 +2735,16 @@ class NPUModelRunner(GPUModelRunner):
         run_model = partial(self.model, **model_inputs)
 
         if self.enable_enpu:
-            # The soft segmentation scenario requires event.record first, then event.wait
-            self._update_full_graph_params_if_needed(forward_context, num_tokens_padded)
-            hidden_states = run_model()
+            # The soft segmentation scenario requires event.record first, then event.wait.
+            with record_function_or_nullcontext("ascend::update_full_graph_params"):
+                self._update_full_graph_params_if_needed(forward_context, num_tokens_padded)
+            with record_function_or_nullcontext("ascend::model_execution"):
+                hidden_states = run_model()
         else:
-            hidden_states = run_model()
-            self._update_full_graph_params_if_needed(forward_context, num_tokens_padded)
+            with record_function_or_nullcontext("ascend::model_execution"):
+                hidden_states = run_model()
+            with record_function_or_nullcontext("ascend::update_full_graph_params"):
+                self._update_full_graph_params_if_needed(forward_context, num_tokens_padded)
 
         if forward_context.flash_comm_v1_enabled and not isinstance(hidden_states, IntermediateTensors):
             hidden_states = self._all_gather_hidden_states_and_aux(hidden_states)

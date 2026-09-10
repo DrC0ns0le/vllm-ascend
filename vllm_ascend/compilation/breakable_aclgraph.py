@@ -19,14 +19,17 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from functools import partial
 from time import perf_counter
 from typing import Any
 
 import torch
+import vllm.envs as vllm_envs
 from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphWrapper
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.forward_context import get_forward_context
 from vllm.logger import logger
+from vllm.v1.utils import record_function_or_nullcontext
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.compilation.acl_graph import (
@@ -35,6 +38,11 @@ from vllm_ascend.compilation.acl_graph import (
     get_graph_params,
     weak_ref_workspaces,
 )
+
+
+def _profile_replay_segment(segment: Callable[[], Any], label: str) -> Any:
+    with record_function_or_nullcontext(label):
+        return segment()
 
 
 class BreakableACLGraphWrapper(BreakableCUDAGraphWrapper):
@@ -52,6 +60,7 @@ class BreakableACLGraphWrapper(BreakableCUDAGraphWrapper):
 
         self.use_eagle = use_eagle
         self.enable_enpu = enable_enpu
+        self.profile_replay = vllm_envs.VLLM_CUSTOM_SCOPES_FOR_PROFILING
 
     def validate_piecewise_capture(self, capture_descs):
         """Check the parent's startup capture covered all mixed token buckets."""
@@ -102,6 +111,21 @@ class BreakableACLGraphWrapper(BreakableCUDAGraphWrapper):
             weak_ref_workspaces(get_draft_graph_params())
             weak_ref_workspaces(get_draft_graph_prefill_params())
 
+        if self.profile_replay:
+            # Add labels only for explicit profiling runs. Normal serving
+            # keeps upstream's original callables and submission loop.
+            mode = forward_context.cudagraph_runtime_mode.name
+            tokens = entry.batch_descriptor.num_tokens
+            entry.capture.segments = [
+                partial(
+                    _profile_replay_segment,
+                    segment,
+                    f"ascend::{mode}::tokens={tokens}::segment={index}::"
+                    f"{'graph' if getattr(segment, '__name__', '') == 'replay' else 'eager'}",
+                )
+                for index, segment in enumerate(entry.capture.segments)
+            ]
+
         # Keep capturing=True on a successful FULL capture until the caller
         # finishes: MRV1 uses it to skip replay-only attention parameter updates.
         logger.info(
@@ -133,6 +157,7 @@ class BreakableACLGraphWrapper(BreakableCUDAGraphWrapper):
             # parameter updates and the previous/current FULL graph replay.
             is_draft_eagle = _EXTRA_CTX.is_draft_model and self.use_eagle
             if not self.enable_enpu and not is_draft_eagle:
-                torch.npu.current_stream().synchronize()
+                with record_function_or_nullcontext("ascend::full_replay_sync"):
+                    torch.npu.current_stream().synchronize()
         super()._replay(entry, args, kwargs)
         return entry.output

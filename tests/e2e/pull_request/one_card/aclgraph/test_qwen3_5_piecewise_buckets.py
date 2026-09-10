@@ -6,6 +6,26 @@ import torch
 from vllm import SamplingParams
 
 from tests.e2e.conftest import VllmRunner, wait_until_npu_memory_free
+from vllm_ascend.ops.gdn_attn_builder import _upload_chunk_metadata
+
+
+def test_packed_gdn_metadata_views_on_npu():
+    if not torch.npu.is_available():
+        pytest.skip("Requires NPU")
+    device = torch.device("npu")
+    expected = [
+        torch.tensor([[0, 0], [1, 0], [1, 1]], dtype=torch.int32),
+        torch.tensor([0, 1, 3], dtype=torch.int64),
+        torch.tensor([True, False, True], dtype=torch.bool),
+    ]
+    first = _upload_chunk_metadata(expected, device)
+    # Submit another step before reading the first back. Its tables must not
+    # overwrite or release storage still owned by the first metadata object.
+    second = _upload_chunk_metadata([table.flip(0) for table in expected], device)
+    for actual, reference in zip(first, expected):
+        torch.testing.assert_close(actual.cpu(), reference)
+    for actual, reference in zip(second, expected):
+        torch.testing.assert_close(actual.cpu(), reference.flip(0))
 
 
 def run_arrivals(llm):

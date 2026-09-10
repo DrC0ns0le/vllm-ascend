@@ -33,17 +33,11 @@ from vllm.v1.attention.backends.utils import (
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
 
-from vllm_ascend.ops.triton.fla.utils import (
-    prepare_chunk_indices,
-    prepare_chunk_offsets,
-    prepare_final_chunk_indices,
-    prepare_update_chunk_offsets,
-)
-
 _GDN_CHUNK_SIZE = 64
 # Keep this aligned with solve_tril.LARGE_BLOCK_T in ops/triton/fla/solve_tril.py.
 _GDN_SOLVE_TRIL_LARGE_BLOCK_SIZE = 608 * 2
 _GDN_CUMSUM_WORKING_SET = 2**18
+_GDN_METADATA_ALIGNMENT_BYTES = 512
 
 
 def _stable_argsort_for_npu(tensor: torch.Tensor) -> torch.Tensor:
@@ -144,31 +138,44 @@ def _build_actual_seq_lengths(
     return actual_seq_lengths
 
 
-def _compact_empty_segments(cu_seqlens_host, initial_state, device=None):
-    """Drop zero-length segments so AscendC fwd_h/fwd_o indexing lines up.
+def _chunk_indices_from_lengths(lengths: tuple[int, ...], chunk_size: int) -> list[int]:
+    # Match prepare_chunk_indices: zero-length sequences have no chunk row,
+    # and the remaining sequence IDs are compact ranks.
+    indices = []
+    sequence = 0
+    for length in lengths:
+        if length:
+            for chunk in range((length + chunk_size - 1) // chunk_size):
+                indices.extend((sequence, chunk))
+            sequence += 1
+    return indices
 
-    Returns ``(cu_seqlens_kern, initial_state_kern, keep_meta)``:
-    cu_seqlens / initial_state with empty segments removed, plus a bool
-    mask (None when nothing was removed).  The compacted ``final_state``
-    must be scattered back via ``keep_meta`` (empty segments keep their
-    initial state).
 
-    When *device* is given, ``keep_meta`` is moved to that device so that
-    callers can index NPU tensors without an extra host→device sync.
-    """
-    if cu_seqlens_host is None:
-        return None, initial_state, None
-    cu = torch.tensor(cu_seqlens_host, dtype=torch.int64)
-    keep = (cu[1:] - cu[:-1]) > 0
-    if bool(keep.all()):
-        return cu_seqlens_host, initial_state, None
-    # Compute compact cu_seqlens while keep is still on CPU (cu is CPU-only).
-    cu_kern = torch.cat([cu[:1], cu[1:][keep]]).tolist()
-    # Move keep to device only for indexing device-side tensors.
-    if device is not None:
-        keep = keep.to(device)
-    st_kern = initial_state[keep] if initial_state is not None else None
-    return cu_kern, st_kern, keep
+def _upload_chunk_metadata(tables: list[torch.Tensor], device: torch.device) -> list[torch.Tensor]:
+    # Each metadata object owns a new allocation. Do not reuse a slab while
+    # asynchronous replay may still consume the preceding step's tables.
+    # Keep every table aligned independently of the preceding table's size,
+    # including dtype reinterpretation and Triton pointer alignment hints.
+    offsets = []
+    size = 0
+    for table in tables:
+        offsets.append(size)
+        nbytes = table.numel() * table.element_size()
+        size += (
+            (nbytes + _GDN_METADATA_ALIGNMENT_BYTES - 1)
+            // _GDN_METADATA_ALIGNMENT_BYTES
+            * _GDN_METADATA_ALIGNMENT_BYTES
+        )
+    packed = torch.empty(size, dtype=torch.uint8, device="cpu", pin_memory=device.type != "cpu")
+    for table, offset in zip(tables, offsets):
+        nbytes = table.numel() * table.element_size()
+        packed[offset : offset + nbytes].copy_(table.view(torch.uint8).reshape(-1))
+    packed_device = packed.to(device=device, non_blocking=True)
+    views = []
+    for table, offset in zip(tables, offsets):
+        nbytes = table.numel() * table.element_size()
+        views.append(packed_device[offset : offset + nbytes].view(table.dtype).view(table.shape))
+    return views
 
 
 def _build_non_spec_chunked_prefill_metadata(
@@ -189,38 +196,48 @@ def _build_non_spec_chunked_prefill_metadata(
     cumsum_chunks = max(1, _GDN_CUMSUM_WORKING_SET // (gdn_num_heads * _GDN_CHUNK_SIZE))
     cumsum_chunk_size = 1 if cumsum_chunks <= 1 else 1 << (cumsum_chunks - 1).bit_length()
 
-    chunk_indices_chunk64 = prepare_chunk_indices(cu_seqlens_cpu, _GDN_CHUNK_SIZE)
-    chunk_offsets_chunk64 = prepare_chunk_offsets(cu_seqlens_cpu, _GDN_CHUNK_SIZE)
-    update_chunk_offsets_chunk64 = prepare_update_chunk_offsets(cu_seqlens_cpu, _GDN_CHUNK_SIZE)
-    final_chunk_indices_chunk64 = prepare_final_chunk_indices(cu_seqlens_cpu, _GDN_CHUNK_SIZE)
-    chunk_indices_large_block = prepare_chunk_indices(
-        cu_seqlens_cpu,
-        _GDN_SOLVE_TRIL_LARGE_BLOCK_SIZE,
-    )
-    block_indices_cumsum = prepare_chunk_indices(cu_seqlens_cpu, cumsum_chunk_size)
-
-    cu_seqlens_host = tuple(cu_seqlens_cpu.to(torch.int64).reshape(-1).tolist())
-    num_decodes = sum(1 for seq_start, seq_end in zip(cu_seqlens_host, cu_seqlens_host[1:]) if seq_end - seq_start == 1)
-    # Pre-compute compact cu_seqlens for AscendC kernels so each layer
-    # can reuse them instead of calling _compact_empty_segments again.
-    cu_seqlens_kern, _, keep_meta = _compact_empty_segments(cu_seqlens_host, None, device=device)
-    if keep_meta is None:
-        cu_seqlens_kern = None
-    else:
-        cu_seqlens_kern = tuple(cu_seqlens_kern)
-
+    # These boundaries are scheduler-owned CPU data. Construct the small
+    # integer tables without a chain of CPU Tensor/arange/cat/cumsum calls.
+    assert cu_seqlens_cpu.device.type == "cpu"
+    cu_seqlens_host = tuple(cu_seqlens_cpu.reshape(-1).tolist())
+    lengths = tuple(end - start for start, end in zip(cu_seqlens_host, cu_seqlens_host[1:]))
+    chunk_indices = _chunk_indices_from_lengths(lengths, _GDN_CHUNK_SIZE)
+    offsets, update_offsets = [0], [0]
+    for length in lengths:
+        chunks = (length + _GDN_CHUNK_SIZE - 1) // _GDN_CHUNK_SIZE
+        offsets.append(offsets[-1] + chunks)
+        update_offsets.append(update_offsets[-1] + chunks + 1)
+    tables = [
+        torch.tensor(chunk_indices, dtype=cu_seqlens_cpu.dtype).reshape(-1, 2),
+        torch.tensor(offsets, dtype=torch.int64),
+        torch.tensor(update_offsets, dtype=torch.int64),
+        torch.tensor([offset - 1 for offset in update_offsets[1:]], dtype=torch.int64),
+        torch.tensor(
+            _chunk_indices_from_lengths(lengths, _GDN_SOLVE_TRIL_LARGE_BLOCK_SIZE),
+            dtype=cu_seqlens_cpu.dtype,
+        ).reshape(-1, 2),
+        torch.tensor(_chunk_indices_from_lengths(lengths, cumsum_chunk_size), dtype=cu_seqlens_cpu.dtype).reshape(
+            -1, 2
+        ),
+    ]
+    keep = tuple(length > 0 for length in lengths)
+    cu_seqlens_kern = None
+    if not all(keep):
+        tables.append(torch.tensor(keep, dtype=torch.bool))
+        cu_seqlens_kern = (cu_seqlens_host[0], *(end for end, live in zip(cu_seqlens_host[1:], keep) if live))
+    device_tables = _upload_chunk_metadata(tables, device)
     return GDNChunkedPrefillMetadata(
         cu_seqlens_host=cu_seqlens_host,
-        chunk_indices_chunk64_host=tuple(chunk_indices_chunk64.to(torch.int64).reshape(-1).tolist()),
-        chunk_indices_chunk64=chunk_indices_chunk64.to(device=device, non_blocking=True),
-        chunk_offsets_chunk64=chunk_offsets_chunk64.to(device=device, non_blocking=True),
-        update_chunk_offsets_chunk64=update_chunk_offsets_chunk64.to(device=device, non_blocking=True),
-        final_chunk_indices_chunk64=final_chunk_indices_chunk64.to(device=device, non_blocking=True),
-        chunk_indices_large_block=chunk_indices_large_block.to(device=device, non_blocking=True),
-        block_indices_cumsum=block_indices_cumsum.to(device=device, non_blocking=True),
-        num_decodes=num_decodes,
+        chunk_indices_chunk64_host=tuple(chunk_indices),
+        chunk_indices_chunk64=device_tables[0],
+        chunk_offsets_chunk64=device_tables[1],
+        update_chunk_offsets_chunk64=device_tables[2],
+        final_chunk_indices_chunk64=device_tables[3],
+        chunk_indices_large_block=device_tables[4],
+        block_indices_cumsum=device_tables[5],
+        num_decodes=sum(length == 1 for length in lengths),
         cu_seqlens_kern=cu_seqlens_kern,
-        keep_meta=keep_meta,
+        keep_meta=device_tables[6] if not all(keep) else None,
     )
 
 
