@@ -7,6 +7,7 @@ actual method from gdn.py. NPU arithmetic is covered by numerical.py on hardware
 
 import ast
 import logging
+from functools import wraps
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -15,7 +16,7 @@ import pytest
 import torch
 
 
-def load_core(context, monkeypatch, saved):
+def load_core(context, monkeypatch, saved, eager_break=lambda fn: fn):
     path = Path(__file__).resolve().parents[4] / "vllm_ascend/ops/gdn.py"
     tree = ast.parse(path.read_text())
     core = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "_forward_core")
@@ -34,6 +35,7 @@ def load_core(context, monkeypatch, saved):
     baseline = Mock(side_effect=lambda **kwargs: (kwargs["v"] + 10, kwargs["initial_state"] + 5))
     namespace = dict(
         torch=torch,
+        eager_break_during_capture=eager_break,
         get_forward_context=lambda: context,
         GDNAttentionMetadata=SimpleNamespace,
         logging=logging,
@@ -269,3 +271,80 @@ def test_native_mixed_core_reuses_padded_buffers_across_arrivals_and_state_slots
         else:
             decode.assert_not_called()
         assert output[actual:].eq(0).all()
+
+
+@pytest.mark.parametrize("upstream_break", [False, True])
+def test_warmup_without_metadata_records_gdn_for_live_piecewise_replay(monkeypatch, upstream_break):
+    # Model the upstream capture boundary contract: nested decorators do not
+    # add another eager segment, and the callable runs again on each replay.
+    # Device graph operations and NPU arithmetic are not emulated here.
+    context = SimpleNamespace(attn_metadata=None)
+    capturing = True
+    segments = []
+
+    def eager_break(fn):
+        @wraps(fn)
+        def call(*args, **kwargs):
+            nonlocal capturing
+            if not capturing:
+                return fn(*args, **kwargs)
+            capturing = False
+            try:
+                result = fn(*args, **kwargs)
+                segments.append(lambda: fn(*args, **kwargs))
+                return result
+            finally:
+                capturing = True
+
+        return call
+
+    model = layer()
+    core, baseline, decode = load_core(context, monkeypatch, [], eager_break=eager_break)
+    # Old upstream calls _forward_core directly; new upstream adds its own
+    # decorator around the custom op. Both must record exactly one callback.
+    dispatch = eager_break(core) if upstream_break else core
+    inputs = torch.arange(128).reshape(64, 2).float()
+    gates = torch.zeros(64, 1)
+    output = torch.zeros(64, 1, 2)
+    dispatch(model, inputs, gates, gates, output)
+    assert len(segments) == 1, "GDN vanished from the warmup graph when metadata was None"
+    baseline.assert_not_called()
+    capturing = False
+    for length, slot, stateful in [(61, 1, False), (17, 0, True), (44, 2, False)]:
+        baseline.reset_mock()
+        before = model.kv_cache[1].clone()
+        flags = torch.tensor([stateful])
+        cu = torch.tensor([0, length])
+        metadata = SimpleNamespace(
+            spec_sequence_masks=None,
+            spec_token_indx=None,
+            non_spec_token_indx=None,
+            spec_state_indices_tensor=None,
+            non_spec_state_indices_tensor=torch.tensor([slot]),
+            num_actual_tokens=length,
+            num_decodes=0,
+            num_prefills=1,
+            num_decode_tokens=0,
+            non_spec_prefill_metadata=SimpleNamespace(
+                causal_conv1d=SimpleNamespace(
+                    query_start_loc=cu, cache_indices=torch.tensor([slot]), initial_state_mode=flags
+                ),
+                chunk=SimpleNamespace(fresh_prefill=not stateful),
+            ),
+            prefill_query_start_loc=cu,
+            prefill_state_indices=torch.tensor([slot]),
+            prefill_has_initial_state=flags,
+        )
+        context.attn_metadata = {"gdn": metadata}
+        inputs.add_(1)
+        output.zero_()  # The preceding captured segment resets this buffer.
+        for replay in segments:
+            replay()
+        baseline.assert_called_once()
+        assert baseline.call_args.kwargs["prebuilt_meta"] is metadata.non_spec_prefill_metadata.chunk
+        torch.testing.assert_close(output[:length, 0], inputs[:length] + 10)
+        assert output[length:].eq(0).all()
+        initial = before[slot] if stateful else torch.zeros_like(before[slot])
+        torch.testing.assert_close(model.kv_cache[1][slot], initial + 5)
+    assert len(segments) == 1
+    decode.assert_not_called()

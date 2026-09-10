@@ -273,6 +273,11 @@ Projection, normalization, and MLP regions replay captured graphs. The operator
 breaks read the current request boundaries and state slots on every replay.
 Uniform decode keeps its standard FULL graph path.
 
+The Ascend GDN core owns its eager break, including when warmup has no attention
+metadata. This also supports vLLM versions whose Qwen custom operator does not
+declare a break. Replay must execute GDN with current metadata; capturing its
+no-metadata warmup return would omit recurrent computation entirely.
+
 ```bash
 VLLM_USE_V2_MODEL_RUNNER=0 VLLM_USE_BREAKABLE_CUDAGRAPH=1 \
 vllm serve Qwen/Qwen3.5-2B \
@@ -309,7 +314,9 @@ not create a layout-specific graph entry.
 Graph coverage is limited by the final effective capture sizes after platform
 and parallelism compatibility checks. The configuration above targets one NPU.
 Graph warmup does not guarantee every native operator specialization is already
-compiled for every possible layout. Ascend startup/replay accuracy and mixed
+compiled for every possible layout. GDN's native operator sequence is submitted
+from Python at each eager break, so token bucket coverage does not eliminate
+the host overhead within that sequence. Ascend startup/replay accuracy and mixed
 serving latency must still be validated on hardware; CPU contract tests do not
 establish either accuracy or performance on NPU.
 

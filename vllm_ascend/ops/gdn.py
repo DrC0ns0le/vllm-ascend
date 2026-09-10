@@ -19,6 +19,7 @@ import logging
 
 import torch
 from einops import rearrange
+from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import get_current_vllm_config
 from vllm.distributed import get_pcp_group
 from vllm.forward_context import get_forward_context
@@ -169,6 +170,11 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             output[:num_tokens] = out
         return out
 
+    # Older vLLM versions do not mark qwen_gdn_attention_core as a break.
+    # Own the boundary here, before the no-metadata warmup return, so replay
+    # always re-enters the core with the current request metadata. If the
+    # upstream op already opened an eager segment, this decorator is a no-op.
+    @eager_break_during_capture
     def _forward_core(
         self,
         mixed_qkv: torch.Tensor,
