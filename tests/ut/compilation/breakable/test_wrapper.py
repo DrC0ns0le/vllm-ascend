@@ -48,6 +48,9 @@ def wrapper_module(monkeypatch):
         "vllm.forward_context": dict(get_forward_context=lambda: context),
         "vllm.logger": dict(logger=Mock()),
         "vllm_ascend.ascend_forward_context": dict(_EXTRA_CTX=SimpleNamespace(is_draft_model=False)),
+        "vllm_ascend.compilation.native_full_graph": dict(
+            NativeFullGraphCache=lambda config: SimpleNamespace(enabled=False)
+        ),
         "vllm_ascend.compilation.acl_graph": dict(
             get_graph_params=lambda: "main",
             get_draft_graph_params=lambda: "draft",
@@ -183,3 +186,31 @@ def test_model_scopes_preserve_attention_update_order(enpu):
     )
     assert namespace[method.name](runner, 64) is output
     assert events == (["update", "model"] if enpu else ["model", "update"])
+
+
+@pytest.mark.parametrize("warming", [False, True])
+def test_native_full_is_consulted_before_ordinary_wrapper_dispatch(wrapper_module, warming):
+    module, context, mode, events = wrapper_module
+    context.attn_metadata = {"gdn": object()}
+    context.cudagraph_runtime_mode = mode.PIECEWISE
+    wrapper = module.BreakableACLGraphWrapper(None, None)
+    wrapper.runnable = Mock()
+    native = SimpleNamespace(
+        enabled=True,
+        warming=warming,
+        ready=not warming,
+        run=Mock(return_value="replay"),
+        warmup=Mock(return_value="startup"),
+    )
+    wrapper.native_full = native
+    result = wrapper(input_ids="tokens", positions="positions")
+    assert result == ("startup" if warming else "replay")
+    assert not events
+    if warming:
+        native.warmup.assert_called_once_with(
+            context, dict(input_ids="tokens", positions="positions"), wrapper.runnable
+        )
+        native.run.assert_not_called()
+    else:
+        native.run.assert_called_once_with(context, dict(input_ids="tokens", positions="positions"), wrapper.runnable)
+        native.warmup.assert_not_called()

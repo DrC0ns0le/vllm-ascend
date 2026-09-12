@@ -24,8 +24,8 @@ def configure_gdn_piecewise_graphs(config):
         return
     if compilation.cudagraph_mode == CUDAGraphMode.FULL:
         logger.warning(
-            "GDN native mixed execution uses FULL_AND_PIECEWISE instead of FULL: "
-            "prefill and mixed batches replay token buckets with native attention/GDN operators."
+            "GDN uses the FULL_AND_PIECEWISE dispatcher policy. Qwen3.5's native FULL registry "
+            "overrides model execution when enabled; other paths retain piecewise prefill."
         )
         compilation.cudagraph_mode = CUDAGraphMode.FULL_AND_PIECEWISE
     # Use the scheduler's aggregate budget, not a single request's length or

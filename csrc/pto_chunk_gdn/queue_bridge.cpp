@@ -9,6 +9,7 @@
 #include <utility>
 #include <type_traits>
 #include <vector>
+#include "include/queued_launch.h"
 
 namespace {
 constexpr size_t NUM_BUFFERS = 28;
@@ -41,14 +42,14 @@ void enqueue(uintptr_t address, uint32_t blocks, std::vector<at::Tensor> buffers
     at_npu::native::OpCommand command;
     command.Name("PTO_MegaGDN");
     // Retain all input/workspace tensors until the queued launch is submitted.
-    command.SetCustomHandler([address, blocks, buffers = std::move(buffers), stream,
-                              sequences, tokens, matrices]() -> int {
-        std::array<void*, NUM_BUFFERS> pointers;
-        for (size_t i = 0; i < NUM_BUFFERS; ++i) pointers[i] = buffers[i].data_ptr();
-        launch(address, blocks, stream, pointers, sequences, tokens, matrices,
-               std::make_index_sequence<NUM_BUFFERS>{});
-        return 0;
-    });
+    command.SetCustomHandler(ascend_gdn::make_queued_launch(
+        std::move(buffers), [address, blocks, stream, sequences, tokens, matrices](const auto& tensors) {
+            TORCH_CHECK(tensors.size() == NUM_BUFFERS, "MegaGDN launch handler is single-use");
+            std::array<void*, NUM_BUFFERS> pointers;
+            for (size_t i = 0; i < NUM_BUFFERS; ++i) pointers[i] = tensors[i].data_ptr();
+            launch(address, blocks, stream, pointers, sequences, tokens, matrices,
+                   std::make_index_sequence<NUM_BUFFERS>{});
+        }));
     command.Run();
 }
 

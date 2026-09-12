@@ -38,6 +38,7 @@ from vllm_ascend.compilation.acl_graph import (
     get_graph_params,
     weak_ref_workspaces,
 )
+from vllm_ascend.compilation.native_full_graph import NativeFullGraphCache
 
 
 def _profile_replay_segment(segment: Callable[[], Any], label: str) -> Any:
@@ -61,6 +62,23 @@ class BreakableACLGraphWrapper(BreakableCUDAGraphWrapper):
         self.use_eagle = use_eagle
         self.enable_enpu = enable_enpu
         self.profile_replay = vllm_envs.VLLM_CUSTOM_SCOPES_FOR_PROFILING
+        self.native_full = NativeFullGraphCache(vllm_config)
+
+    def __call__(self, *args, **kwargs):
+        context = get_forward_context()
+        if self.native_full.enabled:
+            if self.native_full.warming:
+                return self.native_full.warmup(context, kwargs, self.runnable)
+            if self.native_full.ready and context.attn_metadata is not None:
+                if args:
+                    raise ValueError("Native FULL expects named model inputs")
+                return self.native_full.run(context, kwargs, self.runnable)
+            if not self.native_full.ready:
+                if context.attn_metadata is None or context.cudagraph_runtime_mode == CUDAGraphMode.NONE:
+                    # Uncaptured profiling/initialization is allowed at startup.
+                    return self.runnable(*args, **kwargs)
+                raise RuntimeError("Native FULL serving started before startup capture completed")
+        return super().__call__(*args, **kwargs)
 
     def validate_piecewise_capture(self, capture_descs):
         """Check the parent's startup capture covered all mixed token buckets."""

@@ -281,3 +281,21 @@ def test_incompatible_tensor_dtype_falls_back_before_compile(monkeypatch, field,
     instance(**args, fallback=fallback)
     assert instance.counts == {f"fallback:{reason}": 1}
     assert fallback.call_args.kwargs[field] is args[field]
+
+
+def test_explicit_fresh_full_graph_runs_megagdn_without_fallback(npu_eligibility, runtime_context):
+    context, _ = runtime_context
+    context.cudagraph_runtime_mode = RuntimeMode.FULL
+    args = arguments()
+    instance = backend.MegaGDNBackend(topology_supported=True, prefix="graph")
+    instance.kernel = SimpleNamespace(run=Mock(return_value=(args["q"].half(), args["initial_state"].half())))
+    fallback = Mock(side_effect=AssertionError("explicit graph backend must not fall back"))
+    workspace = object()
+    output, state = instance(**args, native_graph=True, fallback=fallback, workspace=workspace)
+    assert output.dtype == torch.bfloat16 and state.dtype == torch.float32
+    instance.kernel.run.assert_called_once()
+    assert instance.kernel.run.call_args.kwargs["workspace"] is workspace
+    fallback.assert_not_called()
+    args["fresh_prefill"] = False
+    with pytest.raises(ValueError, match="stateful_or_unknown"):
+        instance(**args, native_graph=True, fallback=fallback)

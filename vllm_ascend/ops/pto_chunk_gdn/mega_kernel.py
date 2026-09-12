@@ -6,6 +6,7 @@ import torch
 
 from vllm_ascend.ops.pto_chunk_gdn.compile import compile_mega_kernel, load_queue_bridge
 from vllm_ascend.ops.pto_chunk_gdn.eligibility import CHUNK_SIZE, total_chunks
+from vllm_ascend.ops.pto_chunk_gdn.workspace import allocate_workspace, workspace_specs
 
 
 class MegaGDNKernel:
@@ -40,6 +41,7 @@ class MegaGDNKernel:
         scale=1.0,
         key_heads=None,
         return_final_state=False,
+        workspace=None,
     ):
         dev = q.device
         H, D = v.shape[2], q.shape[3]
@@ -47,6 +49,8 @@ class MegaGDNKernel:
         T = q.shape[1]
         N_seq = int(cu_seqlens.numel()) - 1
         bd = self.block_dim
+        if C != CHUNK_SIZE:
+            raise ValueError(f"MegaGDN requires chunk_size={CHUNK_SIZE}")
 
         if cu_seqlens.dtype != torch.int32:
             cu_seqlens = cu_seqlens.to(torch.int32)
@@ -56,24 +60,13 @@ class MegaGDNKernel:
         tc = total_chunks(cu_seqlens_host)
         num_matrices = tc * H
 
-        g_sum = torch.empty(1, T, H, device=dev, dtype=torch.float32)
-        g_t = torch.empty(H, T, device=dev, dtype=torch.float32)
-        beta_t = torch.empty(H, T, device=dev, dtype=torch.float16)
-        A = torch.zeros(1, T, H, C, device=dev, dtype=torch.float16)
-        A_inv_f32 = torch.zeros(1, T, H, C, device=dev, dtype=torch.float32)
-        A_inv = torch.zeros(1, T, H, C, device=dev, dtype=torch.float16)
-        w = torch.empty_like(v)
-        u = torch.empty_like(v)
-        s = torch.zeros(tc * H, D, D, device=dev, dtype=torch.float16)
-        v_new = torch.empty_like(v)
+        if workspace is None:
+            scratch = allocate_workspace(workspace_specs(T, H, D, tc, bd), dev)
+        else:
+            scratch = workspace.views(device=dev, tokens=T, heads=H, hidden_size=D, chunks=tc, block_dim=bd)
+        # Keep returned tensors private: a later layer/replay may reuse scratch
+        # before the caller releases its output or final-state reference.
         fs = torch.zeros(N_seq * H, D, D, device=dev, dtype=torch.float16)
-        kkt_ws = torch.zeros(bd * 2, C, C, device=dev, dtype=torch.float16)
-        wy_ws_a1 = torch.zeros(bd, C, C, device=dev, dtype=torch.float16)
-        wy_ws_a2 = torch.zeros(bd, C, C, device=dev, dtype=torch.float16)
-        h_ws = torch.zeros(bd * 4, D, D, device=dev, dtype=torch.float16)
-        o_ws_qk = torch.zeros(bd, C, C, device=dev, dtype=torch.float16)
-        o_ws_qs = torch.zeros(bd, C, D, device=dev, dtype=torch.float16)
-        o_ws_gated = torch.zeros(bd, C, C, device=dev, dtype=torch.float16)
         o_out = torch.empty_like(v)
 
         buffers = [
@@ -87,24 +80,27 @@ class MegaGDNKernel:
             minus_identity,
             cu_seqlens,
             o_out,
-            g_sum,
-            g_t,
-            beta_t,
-            A,
-            A_inv_f32,
-            A_inv,
-            w,
-            u,
-            s,
-            v_new,
+            scratch["g_sum"],
+            scratch["g_t"],
+            scratch["beta_t"],
+            scratch["A"],
+            # Reserved ABI slot: the kernel solves directly into FP16 A_inv
+            # and never dereferences A_inv_f32. Avoid its T*H*C*4 allocation
+            # and fill while retaining compatibility with compiled binaries.
+            scratch["A_inv"],
+            scratch["A_inv"],
+            scratch["w"],
+            scratch["u"],
+            scratch["s"],
+            scratch["v_new"],
             fs,
-            kkt_ws,
-            wy_ws_a1,
-            wy_ws_a2,
-            h_ws,
-            o_ws_qk,
-            o_ws_qs,
-            o_ws_gated,
+            scratch["kkt_ws"],
+            scratch["wy_ws_a1"],
+            scratch["wy_ws_a2"],
+            scratch["h_ws"],
+            scratch["o_ws_qk"],
+            scratch["o_ws_qs"],
+            scratch["o_ws_gated"],
         ]
         self.bridge.enqueue(self.address, bd, buffers, N_seq, T, num_matrices)
 

@@ -34,12 +34,14 @@ from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
 from vllm_ascend import envs
 from vllm_ascend.attention.utils import maybe_save_kv_layer_to_connector
+from vllm_ascend.compilation.native_full_layout import fresh_conv_history, neutral_gdn_padding
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.ops.gdn_attn_builder import AscendGDNAttentionBackend
 from vllm_ascend.ops.pto_chunk_gdn.backend import MegaGDNBackend
 from vllm_ascend.ops.pto_chunk_gdn.eligibility import HEAD_DIM
 from vllm_ascend.ops.triton.fla.chunk import chunk_gated_delta_rule
 from vllm_ascend.ops.triton.fla.fused_qkvzba_split_reshape import fused_qkvzba_split_reshape_cat
+from vllm_ascend.ops.triton.fla.graph_state_writeback import write_fresh_states
 from vllm_ascend.ops.triton.fla.utils import clear_ssm_states
 from vllm_ascend.ops.triton.mamba.causal_conv1d import extract_last_width
 
@@ -170,12 +172,120 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             output[:num_tokens] = out
         return out
 
-    # Older vLLM versions do not mark qwen_gdn_attention_core as a break.
-    # Own the boundary here, before the no-metadata warmup return, so replay
-    # always re-enters the core with the current request metadata. If the
-    # upstream op already opened an eager segment, this decorator is a no-op.
+    def _forward_core(self, mixed_qkv, b, a, core_attn_out):
+        metadata = get_forward_context().attn_metadata
+        layer_metadata = None if metadata is None else metadata[self.prefix]
+        native = getattr(layer_metadata, "native_full", None)
+        if native is not None:
+            # These are capture-time geometry choices, never live request counts.
+            if native.shape.width == 1 and not native.shape.fresh:
+                return self._forward_native_decode_graph(mixed_qkv, b, a, core_attn_out, layer_metadata)
+            return self._forward_native_graph(mixed_qkv, b, a, core_attn_out, layer_metadata)
+        return self._forward_compatibility(mixed_qkv, b, a, core_attn_out)
+
+    def _forward_native_graph(self, mixed_qkv, b, a, core_attn_out, metadata):
+        """Capture fresh prefill with static native launch attributes."""
+        layout = metadata.native_full
+        slots = metadata.non_spec_state_indices_tensor
+        conv_cache, state_cache = self.kv_cache[:2]
+        history_width = self.conv1d.weight.shape[-1] - 1
+        history = fresh_conv_history(
+            mixed_qkv.view(layout.shape.requests, layout.shape.width, -1), layout.lengths, history_width
+        )
+        conv_output = torch.empty_like(mixed_qkv)
+        # Private scratch rows let padded requests run native convolution
+        # without ever touching a live request's cache.
+        scratch = conv_cache.new_empty((layout.shape.requests, *conv_cache.shape[1:]))
+        conv_weights = self.conv1d.weight.view(self.conv1d.weight.size(0), self.conv1d.weight.size(2))
+        torch.ops._C_ascend.npu_causal_conv1d_custom(
+            conv_output,
+            mixed_qkv,
+            conv_weights.transpose(0, 1),
+            conv_state=scratch,
+            bias_opt=self.conv1d.bias,
+            query_start_loc_opt=layout.query_start,
+            cache_indices_opt=metadata.native_conv_indices,
+            initial_state_mode_opt=layout.has_initial_state,
+            num_accepted_tokens_opt=None,
+            activation_mode=int(bool(self.activation)),
+            pad_slot_id=PAD_SLOT_ID,
+            run_mode=0,
+        )
+        write_fresh_states(history.contiguous(), conv_cache, slots)
+        q, k, v = self.rearrange_mixed_qkv(conv_output)
+        g, beta = DeviceOperator.fused_gdn_gating(self.A_log, a, b, self.dt_bias)
+        q, k, v, g, beta = neutral_gdn_padding(q, k, v, g, beta, layout.valid)
+        initial = torch.zeros(
+            (layout.shape.requests, v.shape[2], k.shape[3], v.shape[3]),
+            dtype=state_cache.dtype,
+            device=state_cache.device,
+        )
+        prefill = chunk_gated_delta_rule
+        backend_kwargs = {}
+        if layout.backend == "megagdn":
+            backend = getattr(self, "pto_gdn_backend", None)
+            if backend is None:
+                backend = self.pto_gdn_backend = MegaGDNBackend(topology_supported=True, prefix=self.prefix)
+            prefill = backend
+            backend_kwargs = dict(
+                fresh_prefill=True,
+                native_graph=True,
+                fallback=chunk_gated_delta_rule,
+                workspace=layout.megagdn_workspace,
+            )
+        output, final = prefill(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            initial_state=initial,
+            output_final_state=True,
+            cu_seqlens=layout.query_start,
+            prebuilt_meta=metadata.non_spec_prefill_metadata.chunk,
+            head_first=False,
+            use_qk_l2norm_in_kernel=True,
+            **backend_kwargs,
+        )
+        write_fresh_states(final.transpose(-1, -2).contiguous(), state_cache, slots)
+        core_attn_out.copy_(output.squeeze(0))
+
+    def _forward_native_decode_graph(self, mixed_qkv, b, a, core_attn_out, metadata):
+        layout = metadata.native_full
+        slots = metadata.non_spec_state_indices_tensor
+        conv_output = torch.zeros_like(mixed_qkv)
+        conv_weights = self.conv1d.weight.view(self.conv1d.weight.size(0), self.conv1d.weight.size(2))
+        torch.ops._C_ascend.npu_causal_conv1d_custom(
+            conv_output,
+            mixed_qkv,
+            conv_weights.transpose(0, 1),
+            conv_state=self.kv_cache[0],
+            bias_opt=self.conv1d.bias,
+            query_start_loc_opt=layout.query_start,
+            cache_indices_opt=slots,
+            initial_state_mode_opt=None,
+            num_accepted_tokens_opt=None,
+            activation_mode=int(bool(self.activation)),
+            pad_slot_id=PAD_SLOT_ID,
+            run_mode=1,
+        )
+        q, k, v = self.rearrange_mixed_qkv(conv_output)
+        g, beta = DeviceOperator.fused_gdn_gating(self.A_log, a, b, self.dt_bias)
+        output = torch.ops._C_ascend.npu_recurrent_gated_delta_rule(
+            query=l2norm_fwd(q).squeeze(0),
+            key=l2norm_fwd(k).squeeze(0),
+            value=v.squeeze(0),
+            g=g.squeeze(0),
+            beta=beta.squeeze(0),
+            state=self.kv_cache[1],
+            scale=k.shape[-1] ** -0.5,
+            actual_seq_lengths=metadata.non_spec_decode_metadata.actual_seq_lengths,
+            ssm_state_indices=slots,
+        )
+        core_attn_out.copy_(output)
+
     @eager_break_during_capture
-    def _forward_core(
+    def _forward_compatibility(
         self,
         mixed_qkv: torch.Tensor,
         b: torch.Tensor,

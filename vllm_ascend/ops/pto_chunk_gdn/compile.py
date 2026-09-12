@@ -3,11 +3,13 @@
 
 import hashlib
 import logging
+import os
 import shlex
 import subprocess
 import tempfile
 from pathlib import Path
 from time import perf_counter
+from uuid import uuid4
 
 from filelock import FileLock
 
@@ -16,10 +18,26 @@ from vllm_ascend import envs
 logger = logging.getLogger(__name__)
 KERNELS_PTO = Path(__file__).resolve().parents[3] / "csrc" / "pto_chunk_gdn"
 PTO_COMMIT = "4e27a104f948e883e0bef44670252381bff794c5"
+# Immutable process-import nonce; the PID also separates forked workers.
+BRIDGE_RECOVERY_ID = uuid4().hex
 
 
 def toolkit_path() -> Path:
     return Path(envs.ASCEND_HOME_PATH or "/usr/local/Ascend/ascend-toolkit/latest").resolve()
+
+
+def queue_bridge_build_directory(root: Path) -> Path:
+    """Bypass an existing PyTorch build baton without removing another build's lock."""
+    if not (root / "lock").exists():
+        return root
+    # FileBaton has no owner/dead-process detection. Use one private recovery
+    # directory across this worker's layers instead of waiting indefinitely or
+    # deleting a lock that might still belong to another active builder.
+    recovery = root / f"worker-{os.getpid()}-{BRIDGE_RECOVERY_ID}"
+    if not recovery.exists():
+        recovery.mkdir(parents=True, exist_ok=True)
+        logger.warning("MegaGDN build cache is locked; using isolated build directory %s", recovery)
+    return recovery
 
 
 def compile_mega_kernel(*, num_heads: int, key_heads: int, hidden_size: int = 128, chunk_size: int = 128) -> Path:
@@ -111,11 +129,13 @@ def compile_mega_kernel(*, num_heads: int, key_heads: int, hidden_size: int = 12
 def load_queue_bridge():
     # Lazy imports: CPU/offline and disabled-backend paths need no torch_npu.
     import torch_npu
-    from torch.utils.cpp_extension import load
+    from torch.utils.cpp_extension import _get_build_directory, load
 
     npu_package = Path(torch_npu.__file__).resolve().parent
+    build_directory = queue_bridge_build_directory(Path(_get_build_directory("ascend_pto_gdn_queue", verbose=False)))
     return load(
         name="ascend_pto_gdn_queue",
+        build_directory=str(build_directory),
         sources=[str(KERNELS_PTO / "queue_bridge.cpp")],
         extra_include_paths=[str(npu_package.parent), str(npu_package / "include"), str(toolkit_path() / "include")],
         extra_ldflags=[f"-L{npu_package / 'lib'}", "-ltorch_npu", f"-Wl,-rpath,{npu_package / 'lib'}"],

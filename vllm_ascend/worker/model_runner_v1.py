@@ -2712,6 +2712,26 @@ class NPUModelRunner(GPUModelRunner):
                 self.speculative_config,
             )
 
+    def _preprocess(self, scheduler_output, num_input_tokens, intermediate_tensors=None):
+        native = getattr(self.model, "native_full", None)
+        if native is None or not native.enabled or not native.ready:
+            return super()._preprocess(scheduler_output, num_input_tokens, intermediate_tensors)
+        # Upstream multimodal preprocessing always embeds text outside the
+        # model. Native text graphs own that lookup, including for Qwen3.5 VL.
+        if (
+            intermediate_tensors is not None
+            or self.input_batch.req_prompt_embeds
+            or any(self.requests[req_id].mm_features for req_id in scheduler_output.num_scheduled_tokens)
+        ):
+            raise ValueError("Native Qwen3.5 FULL supports text token IDs only")
+        if self.uses_mrope:
+            positions = self.mrope_positions.gpu[:, :num_input_tokens]
+        elif self.uses_xdrope_dim > 0:
+            positions = self.xdrope_positions.gpu[:, :num_input_tokens]
+        else:
+            positions = self.positions[:num_input_tokens]
+        return self.input_ids.gpu[:num_input_tokens], None, positions, None, {}, None
+
     def _model_forward(
         self,
         num_tokens_padded: int,
@@ -2733,6 +2753,12 @@ class NPUModelRunner(GPUModelRunner):
             **model_kwargs,
         }
         run_model = partial(self.model, **model_inputs)
+        native = getattr(self.model, "native_full", None)
+        if native is not None and native.enabled and (native.ready or native.warming):
+            # This wrapper owns a sealed, self-contained native graph registry.
+            # Standard FULL's per-layer mutable task updates do not apply.
+            with record_function_or_nullcontext("ascend::native_full_execution"):
+                return run_model()
 
         if self.enable_enpu:
             # The soft segmentation scenario requires event.record first, then event.wait.
@@ -2823,6 +2849,12 @@ class NPUModelRunner(GPUModelRunner):
         force_num_active_loras: int | None = None,
         num_encoder_reqs: int = 0,
     ) -> tuple[CUDAGraphMode, BatchDescriptor, bool, torch.Tensor | None, CUDAGraphStat | None]:
+        native = getattr(getattr(self, "model", None), "native_full", None)
+        if native is not None and native.enabled and not force_eager:
+            # Administrative PIECEWISE dispatch keeps the upstream decode-only
+            # FULL metadata policy out of the way. The wrapper executes one
+            # complete native graph per adapted group, with no eager segments.
+            return CUDAGraphMode.PIECEWISE, BatchDescriptor(num_tokens), False, None, None
         num_tokens_padded = self._pad_for_sequence_parallelism(num_tokens)
         is_all_decode = np.all(self.input_batch.num_computed_tokens_cpu[:num_reqs] > 0)
         uniform_decode = (
@@ -3497,6 +3529,11 @@ class NPUModelRunner(GPUModelRunner):
                 input_ids = None
                 inputs_embeds = self.inputs_embeds.gpu[:num_tokens_padded]
             else:
+                input_ids = self.input_ids.gpu[:num_tokens_padded]
+                inputs_embeds = None
+
+            native = getattr(self.model, "native_full", None)
+            if native is not None and native.warming:
                 input_ids = self.input_ids.gpu[:num_tokens_padded]
                 inputs_embeds = None
 
@@ -5085,9 +5122,20 @@ class NPUModelRunner(GPUModelRunner):
         started = time.perf_counter()
         free_before, _ = torch.npu.mem_get_info()
         with _torch_cuda_wrapper(), _replace_gpu_model_runner_function_wrapper(parent_module_name):
-            cuda_graph_size = GPUModelRunner.capture_model(self)
-            if isinstance(self.model, BreakableACLGraphWrapper):
-                self.model.validate_piecewise_capture(self.cudagraph_dispatcher.get_capture_descs())
+            native = getattr(self.model, "native_full", None)
+            if native is not None and native.enabled:
+                native.warming = True
+                try:
+                    self._dummy_run(1, force_attention=True, cudagraph_runtime_mode=CUDAGraphMode.NONE)
+                finally:
+                    native.warming = False
+                if not native.ready:
+                    raise RuntimeError("Native FULL startup capture did not seal its registry")
+                cuda_graph_size = free_before - torch.npu.mem_get_info()[0]
+            else:
+                cuda_graph_size = GPUModelRunner.capture_model(self)
+                if isinstance(self.model, BreakableACLGraphWrapper):
+                    self.model.validate_piecewise_capture(self.cudagraph_dispatcher.get_capture_descs())
         free_after, _ = torch.npu.mem_get_info()
         logger.info(
             "ACLGraph capture summary: sizes=%s duration_s=%.3f free_before=%d free_after=%d memory_delta=%d",

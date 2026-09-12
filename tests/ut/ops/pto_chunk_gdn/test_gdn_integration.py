@@ -19,7 +19,9 @@ import torch
 def load_core(context, monkeypatch, saved, eager_break=lambda fn: fn):
     path = Path(__file__).resolve().parents[4] / "vllm_ascend/ops/gdn.py"
     tree = ast.parse(path.read_text())
-    core = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "_forward_core")
+    core = next(
+        node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "_forward_compatibility"
+    )
     module = ast.Module(
         body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), core],
         type_ignores=[],
@@ -50,7 +52,7 @@ def load_core(context, monkeypatch, saved, eager_break=lambda fn: fn):
         maybe_save_kv_layer_to_connector=lambda *args: saved.append("saved"),
     )
     exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
-    return namespace["_forward_core"], baseline, decode
+    return namespace["_forward_compatibility"], baseline, decode
 
 
 def layer():
@@ -301,8 +303,8 @@ def test_warmup_without_metadata_records_gdn_for_live_piecewise_replay(monkeypat
 
     model = layer()
     core, baseline, decode = load_core(context, monkeypatch, [], eager_break=eager_break)
-    # Old upstream calls _forward_core directly; new upstream adds its own
-    # decorator around the custom op. Both must record exactly one callback.
+    # The ordinary core delegates to this compatibility method; newer
+    # upstream versions also decorate the custom op. Record one callback.
     dispatch = eager_break(core) if upstream_break else core
     inputs = torch.arange(128).reshape(64, 2).float()
     gates = torch.zeros(64, 1)

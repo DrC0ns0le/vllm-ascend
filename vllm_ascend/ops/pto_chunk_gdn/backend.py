@@ -54,6 +54,8 @@ class MegaGDNBackend:
         fresh_prefill,
         fallback,
         scale=None,
+        native_graph=False,
+        workspace=None,
     ):
         cu_host = getattr(prebuilt_meta, "cu_seqlens_host", None)
         reason = fallback_reason(
@@ -76,7 +78,7 @@ class MegaGDNBackend:
             reason = "device_mismatch"
         if reason is None and cu_seqlens.dtype not in (torch.int32, torch.int64):
             reason = "sequence_dtype"
-        if reason is None and not is_piecewise_runtime():
+        if reason is None and not native_graph and not is_piecewise_runtime():
             reason = "runtime_not_piecewise"
         if reason is None:
             # Compile failures propagate. Unsupported hardware falls back before
@@ -85,6 +87,8 @@ class MegaGDNBackend:
             if self.kernel is None:
                 reason = "hardware"
         if reason is not None:
+            if native_graph:
+                raise ValueError(f"MegaGDN fresh graph is unsupported: {reason}")
             self.counts[f"fallback:{reason}"] += 1
             if logger.isEnabledFor(logging.DEBUG):
                 self._log_decision(reason, q, v, cu_host)
@@ -124,6 +128,7 @@ class MegaGDNBackend:
                 cu_seqlens_host=cu_host,
                 scale=q.shape[-1] ** -0.5 if scale is None else scale,
                 return_final_state=True,
+                workspace=workspace,
             )
         if logger.isEnabledFor(logging.DEBUG):
             self._log_decision("megagdn", q, v, cu_host)

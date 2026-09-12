@@ -86,6 +86,7 @@ def test_qwen3_5_piecewise_warmup_padding_and_mixed_arrivals(monkeypatch, capfd)
     with VllmRunner(
         "Qwen/Qwen3.5-2B",
         **options,
+        additional_config={"native_full_graph": False},
         compilation_config={"cudagraph_mode": "FULL_AND_PIECEWISE", "cudagraph_capture_sizes": [1, 64, 128, 196]},
     ) as runner:
         startup = capfd.readouterr()

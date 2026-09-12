@@ -225,4 +225,7 @@ if is_310p():
 else:
     _GDN_PATCH_TARGET.forward = AscendGatedDeltaNetAttention.forward
     _GDN_PATCH_TARGET._forward_core = AscendGatedDeltaNetAttention._forward_core
+    _GDN_PATCH_TARGET._forward_compatibility = AscendGatedDeltaNetAttention._forward_compatibility
+    _GDN_PATCH_TARGET._forward_native_graph = AscendGatedDeltaNetAttention._forward_native_graph
+    _GDN_PATCH_TARGET._forward_native_decode_graph = AscendGatedDeltaNetAttention._forward_native_decode_graph
     _GDN_PATCH_TARGET._warmup_prefill_kernels = AscendGatedDeltaNetAttention._warmup_prefill_kernels

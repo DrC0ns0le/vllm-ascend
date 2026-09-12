@@ -1,10 +1,56 @@
 # SPDX-License-Identifier: Apache-2.0
 import subprocess
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from vllm_ascend.ops.pto_chunk_gdn import compile as compiler
+
+
+@pytest.mark.parametrize("locked", [False, True])
+def test_queue_bridge_uses_isolated_build_directory_without_removing_lock(tmp_path, monkeypatch, locked):
+    import torch.utils.cpp_extension as extension
+
+    root = tmp_path / "extensions"
+    root.mkdir()
+    lock = root / "lock"
+    if locked:
+        lock.write_text("another worker's lock")
+    calls = []
+
+    def load(**kwargs):
+        destination = Path(kwargs["build_directory"])
+        assert destination.is_dir() and not (destination / "lock").exists()
+        calls.append(destination)
+        return "loaded bridge"
+
+    monkeypatch.setitem(sys.modules, "torch_npu", SimpleNamespace(__file__=str(tmp_path / "torch_npu/__init__.py")))
+    monkeypatch.setattr(extension, "_get_build_directory", lambda *args, **kwargs: str(root))
+    monkeypatch.setattr(extension, "load", load)
+    for _ in range(3):
+        assert compiler.load_queue_bridge() == "loaded bridge"
+    assert len(set(calls)) == 1  # Reuse the same binary across layers.
+    if locked:
+        assert calls[0].parent == root and calls[0] != root
+        assert lock.read_text() == "another worker's lock"
+    else:
+        assert calls[0] == root and not lock.exists()
+
+
+def test_recovery_isolates_restarted_and_forked_workers(tmp_path, monkeypatch):
+    (tmp_path / "lock").touch()
+    first = compiler.queue_bridge_build_directory(tmp_path)
+    # Even a stale recovery lock from a previous worker cannot block a restart.
+    (first / "lock").touch()
+    monkeypatch.setattr(compiler, "BRIDGE_RECOVERY_ID", "next-import")
+    restarted = compiler.queue_bridge_build_directory(tmp_path)
+    monkeypatch.setattr(compiler.os, "getpid", lambda: 123456789)
+    forked = compiler.queue_bridge_build_directory(tmp_path)
+    assert len({first, restarted, forked}) == 3
+    assert not (restarted / "lock").exists() and not (forked / "lock").exists()
+    assert (first / "lock").exists() and (tmp_path / "lock").exists()
 
 
 @pytest.fixture

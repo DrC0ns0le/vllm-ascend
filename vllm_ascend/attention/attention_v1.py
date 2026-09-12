@@ -62,6 +62,7 @@ from vllm_ascend.compilation.acl_graph import (
 )
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.memcache_comm_fence import record_attention_compute_start
+from vllm_ascend.ops.native_full_attention import native_cached_attention
 from vllm_ascend.utils import is_950, weak_ref_tensors
 
 # default max value of sliding window size
@@ -1593,6 +1594,9 @@ class AscendAttentionBackendImpl(AttentionImpl):
         output: torch.Tensor,
     ):
         record_attention_compute_start()
+        native_layout = getattr(attn_metadata, "native_full", None)
+        if native_layout is not None and not native_layout.shape.fresh:
+            return native_cached_attention(self, query, attn_metadata, output)
         num_tokens = query.shape[0]
 
         if (

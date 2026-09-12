@@ -265,62 +265,189 @@ vllm serve path/to/Qwen3-32B \
 
 For more details about Xlite, see the [Xlite README](https://atomgit.com/openeuler/GVirt/blob/master/xlite/README.md).
 
-## Qwen3.5 native kernels with piecewise token buckets
+## Qwen3.5 fresh-prefill FULL graphs
 
-Use MRV1 breakable graphs with `FULL_AND_PIECEWISE` to retain native Ascend
-attention and GDN operators for fresh, continuation, chunked, and mixed prefill.
-Projection, normalization, and MLP regions replay captured graphs. The operator
-breaks read the current request boundaries and state slots on every replay.
-Uniform decode keeps its standard FULL graph path.
-
-The Ascend GDN core owns its eager break, including when warmup has no attention
-metadata. This also supports vLLM versions whose Qwen custom operator does not
-declare a break. Replay must execute GDN with current metadata; capturing its
-no-metadata warmup return would omit recurrent computation entirely.
+For MRV1 breakable Qwen3.5, `FULL` and `FULL_AND_PIECEWISE` use a startup-captured
+registry for fresh prefill and one-token decode. A fresh prefill has no preceding
+recurrent state or cached attention prefix. Disable chunked prefill and prefix
+caching to keep ordinary prompt traffic in this category. Allow enough scheduler
+tokens to admit complete prompts; increasing this budget does not itself disable
+chunking or prevent preemption.
 
 ```bash
 VLLM_USE_V2_MODEL_RUNNER=0 VLLM_USE_BREAKABLE_CUDAGRAPH=1 \
 vllm serve Qwen/Qwen3.5-2B \
   --dtype bfloat16 \
   --tensor-parallel-size 1 \
-  --max-model-len 768 \
+  --max-model-len 1024 \
   --max-num-seqs 64 \
-  --max-num-batched-tokens 4096 \
-  --enable-chunked-prefill \
+  --max-num-batched-tokens 49152 \
+  --no-enable-chunked-prefill \
   --no-enable-prefix-caching \
   --mamba-cache-mode none \
-  --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","cudagraph_capture_sizes":[1,64,128,196,256,384,512,768,1024,1536,2048,3172,4096]}'
+  --additional-config '{"native_full_graph_backend":"ascendc","native_full_graph_request_counts":[1,2,4,8,16,32,64]}' \
+  --compilation-config '{"cudagraph_mode":"FULL","cudagraph_capture_sizes":[1,64,128,196,256,384,512,768,1024]}'
 ```
 
-For breakable GDN models, a request for `FULL` now resolves to
-`FULL_AND_PIECEWISE` with a warning. The experimental native FULL-prefill cache,
-device attention kernel, and fused GDN state/output route have been removed.
-The old `full_prefill_graph_max_entries` setting has no effect. Leave
-`VLLM_ASCEND_PTO_CHUNK_GDN` disabled (its default) to use the baseline AscendC
-GDN pipeline; MegaGDN remains a separate explicit opt-in.
+The scheduler token budget and request-count list also control startup capture
+memory; choose them for the available NPU headroom. Actual memory and performance
+require NPU measurement.
 
-Startup warms and captures the dispatcher's predefined token buckets, then
-checks that all piecewise entries exist. Breakable GDN configuration adds
-`max_num_batched_tokens` as a final bucket when needed. This is the aggregate
-scheduler token budget, not the maximum length of one request.
+### Static shapes, rounding, and arrivals
 
-At serving time, the dispatcher rounds the total scheduled tokens up to the
-smallest covering bucket. For example, `[61]`, `[17,44]`, and `[1,1,59]` reuse
-the same 64-token piecewise graphs. Their native operators still receive the
-original boundaries. Padding does not add recurrent steps or KV writes, and
-only live output rows are consumed. Changing the prefill/decode mixture does
-not create a layout-specific graph entry.
+The registry contains `(request count, padded query width)` fresh graphs and
+one-token decode graphs. Query widths come from `cudagraph_capture_sizes`, with
+`1` and the largest per-request width fitting the smallest request-count
+bucket and context capacity included. The default
+request counts are powers of two from 1 through the next power of two covering
+`max_num_seqs`. Set `additional_config.native_full_graph_request_counts` to a
+nonempty list of positive integers to choose a different set.
+Both token width and request count **round up** to the next configured size.
+Only rectangles within the aggregate scheduler token budget are captured.
 
-Graph coverage is limited by the final effective capture sizes after platform
-and parallelism compatibility checks. The configuration above targets one NPU.
-Graph warmup does not guarantee every native operator specialization is already
-compiled for every possible layout. GDN's native operator sequence is submitted
-from Python at each eager break, so token bucket coverage does not eliminate
-the host overhead within that sequence. Ascend startup/replay accuracy and mixed
-serving latency must still be validated on hardware; CPU contract tests do not
-establish either accuracy or performance on NPU.
+For example, five fresh prompts of lengths `[17,44,61,30,63]` replay an
+8-request × 64-token graph with the default counts. Three request rows and the
+unused suffix of each real prompt are padding. Batches exceeding the largest
+request-count rectangle are divided into groups; each final group rounds up.
+No fresh prompt is split into continuation chunks by this wrapper.
 
-### Investigating Qwen3.5 submission gaps
+With the default counts and a scheduler token budget of at least 24576 tokens,
+32 fresh 768-token prompts use one 32×768 graph replay. There is no separate
+memory limit that forces this batch into smaller graphs.
+
+Fresh requests and ongoing decodes can coexist in a scheduler step. The wrapper
+groups fresh prompts by padded width and replays decode groups separately, then
+scatters real outputs back into the runner's original order. Startup warms and
+captures every configured rectangle and seals the registry. Serving never
+creates a graph for a new request partition.
+
+All graph inputs have stable addresses. Small metadata is uploaded once per
+group, outside the model graph. There are no per-layer Python GDN callbacks or
+attention task updates. The upstream mode label may remain `FULL_AND_PIECEWISE`
+for compatibility; verify `Native FULL registry sealed:` and the DEBUG message
+`Native FULL replay hit:` to identify actual execution.
+
+### AscendC and MegaGDN
+
+`native_full_graph_backend=ascendc` is the default. Fresh graphs use the existing
+AscendC `chunk_gated_delta_rule_fwd_h` and `chunk_fwd_o` operators, the stock
+Triton front half, and native packed FIA. Their host sequence/chunk attributes
+are constant for each padded rectangle, so no tensor-ABI operator replacements,
+mutable tiling, or stateful-prefill kernel changes are needed.
+
+Set `native_full_graph_backend=megagdn` to capture the existing PTO MegaGDN
+implementation with the same padded inputs and state-writeback rules. It compiles
+and loads during warmup, before capture. An unsupported geometry or compilation
+failure is an error when this backend is explicitly selected; it does not silently
+substitute AscendC. The backend uses FP16 intermediates and requires its own
+numerical validation against the native baseline. The existing PTO toolchain
+must be available. This selection applies only to fresh prefill; decode uses the
+native recurrent operator.
+
+If the PyTorch queue-bridge build cache already contains a `lock` file, loading
+uses a private worker build directory and emits one warning. It does not delete
+the existing lock, which could belong to another live builder. This avoids the
+indefinite wait caused by a lock left behind by an interrupted build; normal
+unlocked cache reuse is unchanged.
+
+MegaGDN uses one shared scratch workspace per native FULL registry and kernel
+geometry. Its capacity covers the largest token count and the largest number of
+per-request chunks across all captured rectangles; these maxima can come from
+different rectangles. Storage is allocated during uncaptured warmup and reused
+across layers and buckets. It does not grow during capture or serving. Outputs,
+final states, and recurrent caches remain separate from scratch, and the existing
+per-launch zero-fills are retained. The unused FP32 inverse allocation is removed;
+the PTO kernel already computes its inverse directly in FP16.
+
+This sharing relies on the registry's serial graph execution on one stream.
+Concurrent requests still use padded batches; they do not run overlapping model
+graphs. Separate model instances and the compatibility path use separate scratch.
+No extra stream synchronization or kernel arithmetic changes are introduced.
+Set `additional_config.native_full_graph_megagdn_shared_workspace` to `false`
+to compare against private scratch allocations with the same math and buckets.
+It defaults to `true` and affects only the MegaGDN native FULL path.
+
+The queue bridge releases its tensor references after submitting the kernel.
+Copies of a handler retained by Torch-NPU's task/release queues share the same
+ownership container, so they cannot prolong those tensor lifetimes after a
+successful submission. This adds no device synchronization and leaves kernel
+math unchanged. Graph pools continue to own replay storage; outputs and the
+registry's shared scratch retain their own owners. Reduced retention does not
+establish how much of a measured OOM it explains; compare total NPU memory using
+the same rectangles.
+
+Startup logs `Native FULL MegaGDN shared scratch: bytes=... geometries=...`.
+These bytes live **outside graph pools**: compare total process NPU memory and
+`torch.npu.memory_allocated()` / `torch.npu.memory_reserved()` after startup,
+alongside graph-pool memory, using identical capture settings. A smaller reported
+graph-capture delta alone does not demonstrate a reduction in total memory.
+The removed FP32 inverse alone saves `4 * padded_tokens * value_heads * 128`
+bytes per launch allocation, plus its zero-fill. Actual total savings and latency
+retention require NPU measurement.
+
+The focused NPU regression test captures two consecutive MegaGDN layers with
+shared scratch, mutates inputs, and replays different rectangles out of capture
+order. It poisons scratch between replays and compares outputs and final states
+exactly against private-workspace launches:
+
+```bash
+pytest -q tests/e2e/pull_request/one_card/aclgraph/test_megagdn_graph_workspace.py
+```
+
+Fresh GDN starts from zero state without gathering existing recurrent cache rows.
+Padding uses zero Q/K/V and zero decay/update gates, preserving the final real
+state. Convolution runs in private scratch rows and commits only the last real
+inputs. A small contiguous-copy kernel excludes negative/dummy state slots;
+recurrence math remains in the selected backend. Padding KV slots are `-1` and
+only real output rows return to the runner.
+
+Decode uses the native recurrent and convolution operators. Padded decode rows
+have zero sequence length and cannot access recurrent state. Cached FIA gathers
+paged K/V into a fixed context-capacity view and uses a device mask. This keeps
+mixed fresh/decode execution graph-contained without stateful prefill captures.
+Its extra K/V gather and padding cost must be measured under concurrency.
+
+### Compatibility and validation
+
+The supported graph configuration is Ascend 910B, text tokens, one rank, and
+`mamba_cache_mode=none`, without speculation, LoRA, KV transfer, or C8.
+Context capacity defaults to `min(max_model_len,1024)` and can be set using
+`additional_config.native_full_graph_max_context`. Count prompt and output
+history when sizing it. Actual image/prompt-embedding inputs are rejected.
+
+A non-fresh multi-token prefill, query larger than the captured widths, or
+context exceeding capture capacity sends the **whole scheduler step** through
+the existing eager native compatibility path. The decision happens before any
+graph advances state. This is intentional for unusual continuation/preemption
+cases; fresh-prefill/decode shapes inside capacity do not take that path.
+`compatibility_steps` on the registry counts these events. A missing entry for
+a supported shape is an error, not a silent fallback.
+
+Run the NPU regression suite after installing the Python changes:
+
+```bash
+pytest -sv tests/e2e/pull_request/one_card/aclgraph/test_qwen3_5_native_full.py
+```
+
+It tests dummy/recycled state slots under capture, both prefill backends,
+irregular prompt lengths, c64 arrivals, repeated slot reuse, real replay counters,
+and an unchanged registry. It compares greedy output against eager execution.
+CPU tests cover round-up routing, state-neutral padding, fresh convolution
+history, dummy metadata, and compatibility decisions. NPU compilation and
+performance have not been tested locally.
+
+After correctness passes, compare AscendC and MegaGDN with the same capture
+configuration. Check zero GDN eager scopes for supported steps, one model graph
+launch per adapted group, and native/selected GDN kernels in the trace. Measure
+state-copy, cached FIA, and GDN device time as well as end-to-end latency. Keep
+profiling and DEBUG logging off for latency measurements.
+
+Set `additional_config.native_full_graph=false` or request `PIECEWISE` to select
+the earlier piecewise implementation explicitly.
+
+### Investigating the optional piecewise path
+
+The following diagnostics apply when `native_full_graph=false`.
 
 Native GDN prefill builds its chunk tables from CPU request boundaries and uploads
 the tables together in one aligned allocation. Each step owns its allocation;
