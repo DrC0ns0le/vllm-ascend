@@ -21,6 +21,8 @@ from typing import TYPE_CHECKING, Any
 from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
 
+from vllm_ascend.qwen35_decode_config import Qwen35DecodeConfig
+
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
@@ -267,6 +269,7 @@ class AscendConfig:
             "VLLM_ASCEND_ENABLE_NZ",
             ascend_envs.VLLM_ASCEND_ENABLE_NZ,
         )
+        self.qwen35_decode = Qwen35DecodeConfig.from_config(vllm_config, self.weight_nz_mode)
 
         from vllm_ascend.utils import model_uses_sfa_sparse
 

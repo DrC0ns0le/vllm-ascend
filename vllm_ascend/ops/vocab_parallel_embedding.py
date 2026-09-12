@@ -39,7 +39,25 @@ from vllm.model_executor.utils import set_weight_attrs
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.distributed.parallel_state import get_embed_tp_group, get_lmhead_tp_group
+from vllm_ascend.ops.qwen35_decode import configure_decode_layer, use_decode_linear
+from vllm_ascend.qwen35_decode_config import Qwen35DecodeConfig
 from vllm_ascend.utils import embedding_tp_enable, get_potential_max_tokens, lmhead_tp_enable
+
+
+class Qwen35DecodeEmbeddingMethod(UnquantizedEmbeddingMethod):
+    """Keep embedding lookup unchanged; optionally specialize the BF16/FP16 head."""
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        super().process_weights_after_loading(layer)
+        configure_decode_layer(layer)
+
+    def apply(self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
+        if use_decode_linear(layer, x):
+            config = layer._ascend_decode_config
+            return torch.ops.vllm.qwen35_decode_linear(
+                x, layer.weight, bias, config.split_k, config.linear_backend == "triton_cube"
+            )
+        return super().apply(layer, x, bias)
 
 
 class AscendVocabParallelEmbedding(VocabParallelEmbedding):
@@ -60,6 +78,7 @@ class AscendVocabParallelEmbedding(VocabParallelEmbedding):
         prefix: str = "",
     ):
         nn.Module.__init__(self)
+        self.prefix = prefix
         self.forward_type = None
         if lmhead_tp_enable() and "head" in prefix:
             self.comm_group = get_lmhead_tp_group()
@@ -96,6 +115,9 @@ class AscendVocabParallelEmbedding(VocabParallelEmbedding):
             quant_method = quant_config.get_quant_method(self, prefix=prefix)
         if quant_method is None:
             quant_method = UnquantizedEmbeddingMethod()
+            decode_config = getattr(get_ascend_config(), "qwen35_decode", None)
+            if isinstance(decode_config, Qwen35DecodeConfig) and decode_config.uses_linear(prefix):
+                quant_method = Qwen35DecodeEmbeddingMethod()
 
         # If we are making an embedding layer, then our quantization linear
         # method must implement the embedding operation. If we are another

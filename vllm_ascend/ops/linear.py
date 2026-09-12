@@ -41,6 +41,7 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.utils.torch_utils import direct_register_custom_op
 
 from vllm_ascend.ops.linear_op import get_parallel_op, get_replicated_op
+from vllm_ascend.ops.qwen35_decode import configure_decode_layer, use_decode_linear
 from vllm_ascend.utils import (
     AscendDeviceType,
     enable_sp,
@@ -96,6 +97,7 @@ class AscendUnquantizedLinearMethod(UnquantizedLinearMethod):
             # shared_expert_gate in ND format, leaving non-310P policy intact.
             if not keep_nd_weight:
                 layer.weight.data = maybe_trans_nz(layer.weight.data)
+        configure_decode_layer(layer)
 
     def apply(
         self,
@@ -103,6 +105,11 @@ class AscendUnquantizedLinearMethod(UnquantizedLinearMethod):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if use_decode_linear(layer, x):
+            config = layer._ascend_decode_config
+            return torch.ops.vllm.qwen35_decode_linear(
+                x, layer.weight, bias, config.split_k, config.linear_backend == "triton_cube"
+            )
         return torch.ops.vllm.unquantized_gemm(x, layer.weight, bias)
 
 

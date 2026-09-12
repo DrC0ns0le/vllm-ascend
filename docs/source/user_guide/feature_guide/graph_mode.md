@@ -4,6 +4,9 @@
 
 This guide explains how graph mode is used in vLLM Ascend.
 
+For the opt-in Qwen3.5-2B/4B BF16/FP16 small-batch kernels and their capture-size
+requirements, see [Qwen3.5 decode kernels](qwen35_decode.md).
+
 vLLM already provides the generic graph-mode architecture, mode definitions, and compile integration. For those upstream concepts, see:
 
 - [CUDA Graphs](https://docs.vllm.ai/en/latest/design/cuda_graphs/)

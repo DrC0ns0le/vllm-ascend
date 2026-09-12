@@ -39,6 +39,7 @@ from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.ops.gdn_attn_builder import AscendGDNAttentionBackend
 from vllm_ascend.ops.pto_chunk_gdn.backend import MegaGDNBackend
 from vllm_ascend.ops.pto_chunk_gdn.eligibility import HEAD_DIM
+from vllm_ascend.ops.qwen35_decode import use_gdn_ba_prepare
 from vllm_ascend.ops.triton.fla.chunk import chunk_gated_delta_rule
 from vllm_ascend.ops.triton.fla.fused_qkvzba_split_reshape import fused_qkvzba_split_reshape_cat
 from vllm_ascend.ops.triton.fla.graph_state_writeback import write_fresh_states
@@ -116,13 +117,23 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 num_tokens = mixed_qkvz.size(0)
                 qkv_size = (self.key_dim * 2 + self.value_dim) // self.tp_size
                 z_size = self.value_dim // self.tp_size
-                mixed_qkv, z = mixed_qkvz.split([qkv_size, z_size], dim=-1)
-                z = z.reshape(z.size(0), -1, self.head_v_dim)
-                ba, _ = self.in_proj_ba(hidden_states)
-                b, a = self._split_ba_for_tp(ba)
+                if self.tp_size == 1 and use_gdn_ba_prepare(self.in_proj_ba, hidden_states):
+                    mixed_qkv, z, b, a = torch.ops.vllm.qwen35_gdn_ba_prepare(
+                        hidden_states,
+                        mixed_qkvz,
+                        self.in_proj_ba.weight,
+                        self.in_proj_ba.bias,
+                        qkv_size,
+                        self.head_v_dim,
+                    )
+                else:
+                    mixed_qkv, z = mixed_qkvz.split([qkv_size, z_size], dim=-1)
+                    z = z.reshape(z.size(0), -1, self.head_v_dim)
+                    ba, _ = self.in_proj_ba(hidden_states)
+                    b, a = self._split_ba_for_tp(ba)
 
-                b = b.contiguous()
-                a = a.contiguous()
+                    b = b.contiguous()
+                    a = a.contiguous()
             else:
                 projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
                 projected_states_ba, _ = self.in_proj_ba(hidden_states)
