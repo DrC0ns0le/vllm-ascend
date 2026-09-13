@@ -592,6 +592,37 @@ def test_spec_conv1d_args_use_device_cache_and_accepted_tokens():
     )
 
 
+@pytest.mark.parametrize("has_drafts", [False, True])
+def test_native_mtp_retains_original_request_state_and_acceptance_views(has_drafts):
+    common = create_common_attn_metadata(
+        BatchSpec(seq_lens=[132 if has_drafts else 129, 61, 80], query_lens=[4 if has_drafts else 1, 61, 1]),
+        block_size=16,
+        device=torch.device("cpu"),
+    )
+    common.is_prefilling = torch.tensor([False, True, False])
+    common.block_table_tensor = torch.tensor([[7, 8, 9, 10], [19, 20, 21, 22], [31, 32, 33, 34]], dtype=torch.int32)
+    builder = _make_builder(device=torch.device("cpu"), num_heads=16, num_speculative_tokens=3)
+    accepted = torch.tensor([4, 1, 3], dtype=torch.int32)
+    metadata = builder.build(
+        0,
+        common,
+        num_accepted_tokens=accepted,
+        num_decode_draft_tokens_cpu=torch.tensor([3, -1, 0], dtype=torch.int32) if has_drafts else None,
+    )
+    assert torch.equal(metadata.native_state_indices, common.block_table_tensor)
+    assert metadata.native_num_accepted_tokens is accepted
+    assert metadata.native_is_prefilling is common.is_prefilling
+    if has_drafts:
+        assert metadata.num_accepted_tokens.tolist() == [4, 3]
+        assert torch.equal(metadata.spec_state_indices_tensor, common.block_table_tensor[[0, 2]])
+        assert metadata.non_spec_state_indices_tensor.tolist() == [19]
+    else:
+        assert metadata.num_accepted_tokens is None
+    # In-place scheduler updates remain visible without another state table.
+    accepted[0] = 2
+    assert metadata.native_num_accepted_tokens.tolist() == [2, 1, 3]
+
+
 def test_full_graph_spec_conv1d_args_keep_request_granularity():
     batch_spec = BatchSpec(
         seq_lens=[4, 4, 4],

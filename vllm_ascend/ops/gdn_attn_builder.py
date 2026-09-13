@@ -556,6 +556,10 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         fast_build: bool = False,
     ) -> GDNAttentionMetadata:
         m = _treat_single_token_prefills_with_state_as_decodes(common_attn_metadata)
+        # Retain the scheduler's request order before the compatibility route
+        # partitions mixed prefill/speculative batches. These are views of the
+        # existing cache ownership and acceptance inputs, not a second cache.
+        native_num_accepted_tokens = num_accepted_tokens
 
         query_start_loc = m.query_start_loc
         query_start_loc_cpu = m.query_start_loc_cpu
@@ -913,6 +917,9 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             batch_ptr=batch_ptr,
             token_chunk_offset_ptr=token_chunk_offset_ptr,
         )
+        attn_metadata.native_state_indices = block_table_tensor
+        attn_metadata.native_num_accepted_tokens = native_num_accepted_tokens
+        attn_metadata.native_is_prefilling = common_attn_metadata.is_prefilling
         attn_metadata = self._attach_non_spec_prefill_metadata(
             attn_metadata,
             non_spec_chunked_prefill_metadata,

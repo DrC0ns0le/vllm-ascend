@@ -274,6 +274,13 @@ caching to keep ordinary prompt traffic in this category. Allow enough scheduler
 tokens to admit complete prompts; increasing this budget does not itself disable
 chunking or prevent preemption.
 
+Qwen3.5 MTP with exactly three speculative tokens is also supported by this
+registry. It captures four-token target verification rows instead of one-token
+decode rows, while preserving the fresh-prefill buckets and backend selection.
+Add `--speculative-config '{"method":"mtp","num_speculative_tokens":3}'` to the
+command below; the checkpoint must include its MTP head. Keep MRV1 and breakable
+graphs enabled. This integration targets dense Qwen3.5-2B/4B, TP=1, BF16 on 910B.
+
 ```bash
 VLLM_USE_V2_MODEL_RUNNER=0 VLLM_USE_BREAKABLE_CUDAGRAPH=1 \
 vllm serve Qwen/Qwen3.5-2B \
@@ -410,7 +417,8 @@ Its extra K/V gather and padding cost must be measured under concurrency.
 ### Compatibility and validation
 
 The supported graph configuration is Ascend 910B, text tokens, one rank, and
-`mamba_cache_mode=none`, without speculation, LoRA, KV transfer, or C8.
+`mamba_cache_mode=none`, without LoRA, KV transfer, or C8. Speculation is limited
+to autoregressive Qwen3.5 MTP with `num_speculative_tokens=3`.
 Context capacity defaults to `min(max_model_len,1024)` and can be set using
 `additional_config.native_full_graph_max_context`. Count prompt and output
 history when sizing it. Actual image/prompt-embedding inputs are rejected.
@@ -435,6 +443,35 @@ and an unchanged registry. It compares greedy output against eager execution.
 CPU tests cover round-up routing, state-neutral padding, fresh convolution
 history, dummy metadata, and compatibility decisions. NPU compilation and
 performance have not been tested locally.
+
+For MTP, startup seals both `Native FULL` (target) and `Native MTP` (draft)
+registries. The same request-count buckets apply to both. Each draft graph
+contains all three draft passes, their LM heads and greedy token selection.
+Only the first draft pass uses the padded query width; the next two use one
+token per padded request. Target rejection sampling remains outside these model
+graphs. Three proposed tokens do not imply three accepted tokens or a fixed
+speedup; measure acceptance rate and end-to-end latency.
+
+Verification uses the existing native speculative convolution and recurrence
+operators and their four physical state checkpoints. Device accepted-token
+counts select the previous round's state. Short final verifications still use
+four-token rows; only real outputs and their accepted checkpoints are consumed.
+Fresh-prefill and verification requests in a mixed step use their respective
+captured groups. Continuation prefill keeps the compatibility behavior above.
+Drafting needs two additional positions inside the captured context capacity;
+near that boundary it uses the existing eager proposer. Setting speculation's
+`enforce_eager=true` explicitly also leaves drafting eager.
+
+Run the dedicated external MTP gate:
+
+```bash
+pytest -sv tests/e2e/pull_request/one_card/aclgraph/test_qwen3_5_native_mtp.py
+```
+
+It covers both dense models and prefill backends, mixed arrivals, output budgets
+of 1/2/5/8/24, stable target/draft replay registries, and captured native kernels
+with acceptance lengths 1–4, reordered requests and dummy slots. NPU correctness,
+MTP acceptance rate and latency still require external validation.
 
 After correctness passes, compare AscendC and MegaGDN with the same capture
 configuration. Check zero GDN eager scopes for supported steps, one model graph

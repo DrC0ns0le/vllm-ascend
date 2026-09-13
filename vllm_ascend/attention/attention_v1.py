@@ -200,6 +200,9 @@ class AscendMetadata:
     model_runner_type: str = ""
     # prefill reshape_and_cache event
     reshape_cache_event: torch.npu.Event = None
+    # Authoritative device lengths after async rejection; seq_lens above is
+    # normally a CPU mirror retained for the legacy FIA ABI.
+    native_seq_lens: torch.Tensor | None = None
 
 
 class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
@@ -392,6 +395,7 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
             num_decodes=num_decodes,
             causal=common_attn_metadata.causal,
             model_runner_type=self.model_config.runner_type,
+            native_seq_lens=common_attn_metadata.seq_lens,
             **backend_metadata,
         )
         return attn_metadata

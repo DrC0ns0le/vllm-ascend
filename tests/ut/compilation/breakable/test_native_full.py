@@ -78,6 +78,12 @@ def load_runtime():
         ),
         GDNDecodeMetadata=lambda conv, lengths: SimpleNamespace(causal_conv1d=conv, actual_seq_lengths=lengths),
         GDNPrefillMetadata=lambda conv, chunk: SimpleNamespace(causal_conv1d=conv, chunk=chunk),
+        GDNSpecCausalConv1dMetadata=lambda cu, slots, accepted: SimpleNamespace(
+            query_start_loc=cu, cache_indices=slots, num_accepted_tokens=accepted
+        ),
+        GDNSpecDecodeMetadata=lambda conv, lengths: SimpleNamespace(
+            spec_causal_conv1d=conv, actual_seq_lengths=lengths
+        ),
         _build_non_spec_chunked_prefill_metadata=lambda builder, cu, device: SimpleNamespace(
             cu_seqlens_host=tuple(cu.tolist()),
             chunk_indices_chunk64=torch.zeros((len(cu) - 1, 2), dtype=torch.int32),
@@ -224,6 +230,7 @@ def sources():
         slot_mapping=torch.arange(10, dtype=torch.int32) + 100,
         actual_seq_lengths_q=[3, 4, 10],
         seq_lens_list=[3, 9, 6],
+        seq_lens=torch.tensor([3, 9, 6], dtype=torch.int32),
         num_actual_tokens=10,
     )
     return SimpleNamespace(
@@ -338,7 +345,7 @@ def test_unsupported_configuration_fails_before_warmup(field, value):
     runtime = load_runtime()
     cfg = config()
     setattr(cfg, field, value)
-    with pytest.raises(ValueError, match="single-rank"):
+    with pytest.raises(ValueError, match="Native Qwen3.5 FULL"):
         runtime.NativeFullGraphCache(cfg)
 
 

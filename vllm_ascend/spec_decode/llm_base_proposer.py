@@ -9,6 +9,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from vllm.compilation.breakable_cudagraph import is_breakable_cudagraph_enabled
 from vllm.config import CUDAGraphMode, VllmConfig, get_layers_from_vllm_config
 from vllm.distributed.parallel_state import (
     get_pp_group,
@@ -46,6 +47,8 @@ from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 from vllm_ascend.compilation.acl_graph import ACLGraphWrapper, update_full_graph_params
+from vllm_ascend.compilation.native_full_graph import native_full_requested
+from vllm_ascend.compilation.native_mtp_graph import NativeMTPGraphCache
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager import (
     prepare_sparse_kv_offload_mtp_dummy_metadata,
@@ -703,7 +706,10 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 if torch.equal(layer_module.shared_head.head.weight, model.lm_head.weight):
                     layer_module.shared_head.head = model.lm_head
 
-        if self.vllm_config.compilation_config.cudagraph_mode.has_full_cudagraphs() and self.use_cuda_graph:
+        self.native_mtp = None
+        if native_full_requested(self.vllm_config) and self.use_cuda_graph and is_breakable_cudagraph_enabled():
+            self.native_mtp = NativeMTPGraphCache(self.vllm_config, self)
+        elif self.vllm_config.compilation_config.cudagraph_mode.has_full_cudagraphs() and self.use_cuda_graph:
             logger.info(
                 "[spec_decode/base] Wrapping draft model with ACLGraphWrapper:"
                 " runtime_mode=FULL, use_eagle=%s, enable_enpu=%s",
@@ -759,6 +765,14 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         dummy_compute_logits=lambda hidden_states: None,
         is_profile=False,
     ):
+        native_mtp = getattr(self, "native_mtp", None)
+        capture_native_mtp = native_mtp is not None and not is_profile
+        if capture_native_mtp:
+            if native_mtp.ready:
+                return
+            # Native target warmup enters with NONE. Drafting still needs a
+            # real attention metadata template before sealing its own registry.
+            aclgraph_runtime_mode = CUDAGraphMode.FULL
         (
             num_tokens,
             num_tokens_across_dp,
@@ -922,6 +936,18 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             if forward_context is not None:
                 forward_context.moe_layer_index = 0
 
+            if capture_native_mtp:
+                native_mtp.warmup(
+                    forward_context,
+                    dict(
+                        input_ids=self.input_ids[:num_tokens],
+                        positions=model_positions,
+                        hidden_states=self.hidden_states[:num_tokens],
+                    ),
+                    self,
+                )
+                return
+
             self._runnable(
                 num_input_tokens=num_tokens,
                 batch_size=batch_size,
@@ -1081,6 +1107,14 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             num_decode_reqs=num_decode_reqs,
         )
         assert self.runner is not None
+        native_mtp = getattr(self, "native_mtp", None)
+        if native_mtp is not None:
+            draft = native_mtp.propose(common_attn_metadata, num_tokens, token_indices_to_sample)
+            if draft is not None:
+                return draft
+        # Shapes outside native capacity retain the existing eager proposer.
+        # Do not admit new graphs or consult an uncaptured ordinary registry.
+        use_cuda_graph = self.use_cuda_graph and native_mtp is None
         dcp_manager = getattr(self.runner, "dcp_manager", None)
         if dcp_manager is not None:
             assert long_seq_args is not None
@@ -1089,7 +1123,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         has_lora = len(self.runner.input_batch.lora_id_to_lora_request) > 0
         uniform_decode = target_model_batch_desc.uniform
 
-        if self.use_cuda_graph:
+        if use_cuda_graph:
             first_runtime_mode, batch_descriptor = self.runner.cudagraph_dispatcher.dispatch(
                 num_tokens=self.get_graph_dispatch_num_tokens(num_tokens, uniform_decode),
                 uniform_decode=uniform_decode,
@@ -1109,7 +1143,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             _,
         ) = self.runner._sync_metadata_across_dp(num_input_tokens, is_draft_model=True)
 
-        if self.use_cuda_graph:
+        if use_cuda_graph:
             aclgraph_runtime_mode, batch_descriptor = self.runner.cudagraph_dispatcher.dispatch(
                 num_tokens=self.get_graph_dispatch_num_tokens(num_input_tokens, uniform_decode),
                 uniform_decode=uniform_decode,
@@ -1377,8 +1411,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         if self.method == "dspark":
             assert draft_token_ids.ndim == 2
             assert draft_token_ids.shape[0] >= batch_size, (
-                f"DSpark graph returned {draft_token_ids.shape[0]} request rows "
-                f"for a real batch of {batch_size}."
+                f"DSpark graph returned {draft_token_ids.shape[0]} request rows for a real batch of {batch_size}."
             )
             assert draft_token_ids.shape[1] == self.num_speculative_tokens
             draft_token_ids = draft_token_ids[:batch_size]

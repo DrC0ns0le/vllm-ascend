@@ -25,6 +25,8 @@ from vllm_ascend.ops.gdn_attn_builder import (
     GDNCausalConv1dMetadata,
     GDNDecodeMetadata,
     GDNPrefillMetadata,
+    GDNSpecCausalConv1dMetadata,
+    GDNSpecDecodeMetadata,
     _build_non_spec_chunked_prefill_metadata,
 )
 from vllm_ascend.ops.pto_chunk_gdn.eligibility import CHUNK_SIZE
@@ -41,6 +43,19 @@ def native_full_requested(config):
         and config.compilation_config.cudagraph_mode in (CUDAGraphMode.FULL, CUDAGraphMode.FULL_AND_PIECEWISE)
         and (config.additional_config or {}).get("native_full_graph", True)
     )
+
+
+def native_full_speculative_tokens(config):
+    spec = config.speculative_config
+    if spec is None:
+        return 0
+    if (
+        getattr(spec, "method", None) not in ("mtp", "qwen3_5_mtp")
+        or getattr(spec, "num_speculative_tokens", None) != 3
+        or getattr(spec, "parallel_drafting", False)
+    ):
+        raise ValueError("Native Qwen3.5 FULL speculation requires autoregressive MTP with num_speculative_tokens=3")
+    return spec.num_speculative_tokens
 
 
 @contextmanager
@@ -69,6 +84,7 @@ class NativeFullEntry:
         self.shape = shape
         self.backend = owner.backend
         self.megagdn_workspace = owner.megagdn_workspace
+        self.uses_speculation = owner.num_speculative_tokens > 0
         self.graph = None
         self.output = None
         self.replays = 0
@@ -87,9 +103,11 @@ class NativeFullEntry:
         self.metadata = {}
         self.capacity = owner.plan.max_context
         self.mask = None
-        chunk = _build_non_spec_chunked_prefill_metadata(
-            SimpleNamespace(vllm_config=owner.config), self.query_start.cpu(), device
-        )
+        chunk = None
+        if owner.requires_gdn:
+            chunk = _build_non_spec_chunked_prefill_metadata(
+                SimpleNamespace(vllm_config=owner.config), self.query_start.cpu(), device
+            )
         memo = {}
         for name, source in context.attn_metadata.items():
             if id(source) in memo:
@@ -130,6 +148,20 @@ class NativeFullEntry:
                     target.num_decodes = count
                     target.num_decode_tokens = tokens
                     target.non_spec_prefill_metadata = None
+                elif not shape.fresh:
+                    target.num_prefills = 0
+                    target.num_prefill_tokens = 0
+                    target.num_spec_decodes = count
+                    target.num_spec_decode_tokens = tokens
+                    target.non_spec_prefill_metadata = None
+                    target.spec_state_indices_tensor = torch.full((count, width), -1, dtype=torch.int32, device=device)
+                    target.num_accepted_tokens = torch.ones(count, dtype=torch.int32, device=device)
+                    target.spec_decode_metadata = GDNSpecDecodeMetadata(
+                        GDNSpecCausalConv1dMetadata(
+                            self.query_start, target.spec_state_indices_tensor, target.num_accepted_tokens
+                        ),
+                        torch.zeros(count + 1, dtype=torch.int32, device=device),
+                    )
             elif type(source).__name__ == "AscendMetadata":
                 target.attn_state = AscendAttentionState.PrefillNoCache
                 target.query_start_loc = self.query_start
@@ -145,15 +177,26 @@ class NativeFullEntry:
                 raise ValueError(f"Native FULL cannot capture metadata {type(source).__name__}")
             self.metadata[name] = target
 
-    def execute(self, runnable):
+    def prepare(self):
         self.valid.copy_(
             (torch.arange(self.shape.width, device=self.lengths.device)[None, :] < self.lengths[:, None]).reshape(-1)
         )
         if not self.shape.fresh:
             for metadata in {id(m): m for m in self.metadata.values()}.values():
                 if type(metadata).__name__ == "GDNAttentionMetadata":
-                    metadata.non_spec_decode_metadata.actual_seq_lengths[1:].copy_(self.lengths)
+                    if self.shape.width == 1:
+                        metadata.non_spec_decode_metadata.actual_seq_lengths[1:].copy_(self.lengths)
+                    else:
+                        # Native recurrence consumes packed row lengths. Keep
+                        # every live row at the capture width (including short
+                        # final verifications); only trailing dummy rows are 0.
+                        metadata.spec_decode_metadata.actual_seq_lengths[1:].copy_(
+                            torch.where(self.lengths > 0, self.shape.width, 0)
+                        )
             self.mask = cached_attention_mask(self.lengths, self.contexts, self.shape.width, self.capacity)
+
+    def execute(self, runnable):
+        self.prepare()
         return runnable(
             input_ids=self.input_ids, positions=self.positions, intermediate_tensors=None, inputs_embeds=None
         )
@@ -193,10 +236,29 @@ class NativeFullEntry:
             seen.add(id(target))
             source = context.attn_metadata[name]
             if type(target).__name__ == "GDNAttentionMetadata":
-                target.non_spec_state_indices_tensor.copy_(
-                    torch.where(lengths > 0, source.non_spec_state_indices_tensor.index_select(0, rows), -1)
-                )
+                all_states = getattr(source, "native_state_indices", None)
+                slots = (
+                    all_states[:, 0] if all_states is not None else source.non_spec_state_indices_tensor
+                ).index_select(0, rows)
+                target.non_spec_state_indices_tensor.copy_(torch.where(lengths > 0, slots, -1))
+                if not self.shape.fresh and width > 1:
+                    if all_states is None or all_states.shape[1] < width:
+                        raise ValueError("Native MTP requires four physical recurrent checkpoints per request")
+                    target.spec_state_indices_tensor.copy_(
+                        torch.where(lengths[:, None] > 0, all_states[:, :width].index_select(0, rows), -1)
+                    )
+                    accepted = source.native_num_accepted_tokens
+                    if accepted is None:
+                        raise ValueError("Native MTP verification requires scheduler accepted-token counts")
+                    target.num_accepted_tokens.copy_(torch.where(lengths > 0, accepted.index_select(0, rows), 1))
             else:
+                # Async speculation may leave optimistic CPU sequence lengths.
+                # Attention must use the authoritative device lengths after
+                # rejection, without a device-to-host synchronization.
+                if self.uses_speculation:
+                    self.contexts.copy_(
+                        torch.where(lengths > 0, source.native_seq_lens.index_select(0, rows) - lengths, 0)
+                    )
                 target.block_tables.copy_(source.block_tables.index_select(0, rows))
                 slots = source.slot_mapping.index_select(0, tokens)
                 target.slot_mapping.copy_(torch.where(valid, slots, -1))
@@ -204,6 +266,10 @@ class NativeFullEntry:
 
 
 class NativeFullGraphCache:
+    entry_type = NativeFullEntry
+    requires_gdn = True
+    registry_name = "Native FULL"
+
     def __init__(self, config):
         self.config = config
         self.enabled = native_full_requested(config)
@@ -216,6 +282,7 @@ class NativeFullGraphCache:
         self.megagdn_workspace = None
         if not self.enabled:
             return
+        self.num_speculative_tokens = native_full_speculative_tokens(config)
         self.backend = (config.additional_config or {}).get("native_full_graph_backend", "ascendc")
         if self.backend not in ("ascendc", "megagdn"):
             raise ValueError("native_full_graph_backend must be ascendc or megagdn")
@@ -232,14 +299,13 @@ class NativeFullGraphCache:
                 )
             )
             or config.cache_config.mamba_cache_mode != "none"
-            or config.speculative_config is not None
             or config.kv_transfer_config is not None
             or config.lora_config is not None
             or getattr(config.quant_config, "enable_c8_quant", False)
         ):
             raise ValueError(
                 "Native Qwen3.5 FULL requires single-rank execution, mamba_cache_mode=none, "
-                "and no speculation, LoRA, KV transfer or C8"
+                "and no LoRA, KV transfer or C8"
             )
         capacity = (config.additional_config or {}).get(
             "native_full_graph_max_context", min(config.model_config.max_model_len, DEFAULT_NATIVE_FULL_MAX_CONTEXT)
@@ -252,6 +318,7 @@ class NativeFullGraphCache:
             config.scheduler_config.max_num_seqs,
             capacity,
             (config.additional_config or {}).get("native_full_graph_request_counts"),
+            self.num_speculative_tokens,
         )
         shared_workspace = (config.additional_config or {}).get("native_full_graph_megagdn_shared_workspace", True)
         if type(shared_workspace) is not bool:
@@ -270,8 +337,16 @@ class NativeFullGraphCache:
             raise ValueError("Native Qwen3.5 FULL currently targets Ascend 910B")
         if self.ready or self.entries:
             raise RuntimeError("Native FULL warmup must run once, before serving")
-        if not any(type(m).__name__ == "GDNAttentionMetadata" for m in context.attn_metadata.values()):
+        if self.requires_gdn and not any(
+            type(m).__name__ == "GDNAttentionMetadata" for m in context.attn_metadata.values()
+        ):
             raise ValueError("Native FULL warmup requires Qwen3.5 GDN metadata")
+        if self.requires_gdn and self.num_speculative_tokens:
+            for metadata in context.attn_metadata.values():
+                if type(metadata).__name__ == "GDNAttentionMetadata":
+                    states = getattr(metadata, "native_state_indices", None)
+                    if states is None or states.ndim != 2 or states.shape[1] < self.plan.decode_width:
+                        raise ValueError("Native MTP capture requires four scheduler-owned recurrent checkpoints")
         # Warmup uses -1 write slots and zero-length decode rows. It never
         # reads/writes scheduler-owned recurrent state.
         stream = torch.npu.Stream()
@@ -282,7 +357,7 @@ class NativeFullGraphCache:
             with torch.npu.stream(stream):
                 # Largest first permits later graphs to reuse the allocator pool.
                 for shape in sorted(self.plan.shapes, key=lambda s: s.tokens, reverse=True):
-                    entry = NativeFullEntry(self, shape, context, inputs)
+                    entry = self.entry_type(self, shape, context, inputs)
                     with native_context(context, entry.metadata, shape.tokens):
                         entry.execute(runnable)
                         stream.synchronize()
@@ -308,7 +383,8 @@ class NativeFullGraphCache:
                 len(self.megagdn_workspace.buffers),
             )
         logger.info(
-            "Native FULL registry sealed: entries=%d widths=%s max_requests=%d max_context=%d backend=%s requests=%s",
+            "%s registry sealed: entries=%d widths=%s max_requests=%d max_context=%d backend=%s requests=%s",
+            self.registry_name,
             len(self.entries),
             self.plan.widths,
             self.plan.max_requests,
@@ -342,7 +418,14 @@ class NativeFullGraphCache:
         if boundaries[-1] != actual:
             raise ValueError("Native FULL attention boundaries do not cover live tokens")
         lengths = attention.seq_lens_list[: len(boundaries) - 1]
-        batches = self.plan.batches(boundaries, lengths)
+        is_prefilling = None
+        if self.num_speculative_tokens:
+            gdn = next(m for m in context.attn_metadata.values() if type(m).__name__ == "GDNAttentionMetadata")
+            flags = gdn.native_is_prefilling
+            if flags is None or flags.device.type != "cpu":
+                raise ValueError("Native MTP requires scheduler CPU prefill/decode classification")
+            is_prefilling = flags[: len(lengths)].tolist()
+        batches = self.plan.batches(boundaries, lengths, is_prefilling)
         if batches is None:
             self.compatibility_steps += 1
             logger.debug("Native FULL compatibility step: non-fresh prefill or capture capacity exceeded")

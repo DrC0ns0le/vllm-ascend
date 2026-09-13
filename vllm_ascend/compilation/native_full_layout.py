@@ -29,9 +29,11 @@ class RequestSlice:
 
 
 class NativeGraphPlan:
-    """Static fresh-prefill rectangles plus one-token cached decode graphs."""
+    """Static fresh-prefill rectangles and fixed-width verification graphs."""
 
-    def __init__(self, capture_sizes, max_tokens, max_requests, max_context, request_counts=None):
+    def __init__(
+        self, capture_sizes, max_tokens, max_requests, max_context, request_counts=None, num_speculative_tokens=0
+    ):
         if min(max_tokens, max_requests, max_context) < 1:
             raise ValueError("Native FULL capacities must be positive")
         if request_counts is None:
@@ -46,21 +48,26 @@ class NativeGraphPlan:
         ceiling = min(max_tokens // self.request_counts[0], max_context)
         if ceiling < 1:
             raise ValueError("Smallest captured request count exceeds the token budget")
-        self.widths = tuple(sorted({1, ceiling} | {n for n in capture_sizes if 0 < n <= ceiling}))
+        self.decode_width = num_speculative_tokens + 1
+        if self.decode_width > ceiling:
+            raise ValueError("Native FULL token/context capacity must fit one complete verification row")
+        self.widths = tuple(sorted({1, ceiling, self.decode_width} | {n for n in capture_sizes if 0 < n <= ceiling}))
         self.max_tokens, self.max_requests, self.max_context = max_tokens, max_requests, max_context
         self.shapes = tuple(
             NativeGraphShape(count, width, fresh)
             for width in self.widths
             for count in self.request_counts
             if count * width <= max_tokens
-            for fresh in ((True, False) if width == 1 else (True,))
+            for fresh in ((True, False) if width == self.decode_width else (True,))
         )
 
-    def batches(self, boundaries, seq_lengths):
+    def batches(self, boundaries, seq_lengths, is_prefilling=None):
         if len(boundaries) != len(seq_lengths) + 1 or not boundaries or boundaries[0] != 0:
             raise ValueError("Invalid native FULL request boundaries")
         if len(seq_lengths) > self.max_requests:
             raise ValueError("Native FULL request count exceeds startup capacity")
+        if is_prefilling is not None and len(is_prefilling) != len(seq_lengths):
+            raise ValueError("Native FULL prefill flags must match the live request count")
         groups = {}
         for request, (start, end, total) in enumerate(zip(boundaries, boundaries[1:], seq_lengths)):
             length = end - start
@@ -69,9 +76,16 @@ class NativeGraphPlan:
             context = total - length
             # No graph specialization or stateful-prefill emulation: caller
             # executes the unchanged compatibility path for this whole step.
-            if total > self.max_context or length > self.widths[-1] or (context > 0 and length > 1):
+            if total > self.max_context or length > self.widths[-1]:
                 return None
-            width = self.widths[bisect_left(self.widths, length)]
+            if context > 0:
+                # A short continuation of a prompt is not MTP verification.
+                # Multi-token cached rows require the scheduler's decode flag.
+                if length > self.decode_width or (length > 1 and (is_prefilling is None or is_prefilling[request])):
+                    return None
+                width = self.decode_width
+            else:
+                width = self.widths[bisect_left(self.widths, length)]
             groups.setdefault((width, context == 0), []).append(RequestSlice(request, start, length, context))
         result = []
         for (width, fresh), items in groups.items():

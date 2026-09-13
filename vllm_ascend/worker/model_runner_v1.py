@@ -3166,6 +3166,13 @@ class NPUModelRunner(GPUModelRunner):
                     num_accepted_tokens=self.num_accepted_tokens.gpu[:num_reqs_padded],
                     num_decode_draft_tokens_cpu=self.num_decode_draft_tokens.cpu[:num_reqs_padded],
                 )
+            elif isinstance(builder, GDNAttentionMetadataBuilder) and not is_gdn_noop:
+                native = getattr(self.model, "native_full", None)
+                if native is not None and native.enabled and native.num_speculative_tokens:
+                    # The final verification may contain only the bonus token.
+                    # It still starts at the previous round's accepted state.
+                    # Do not pass a stale draft-count buffer for a no-draft step.
+                    extra_attn_metadata_args["num_accepted_tokens"] = self.num_accepted_tokens.gpu[:num_reqs_padded]
 
             if isinstance(builder, (AscendDSAMetadataBuilder, AscendDSACPMetadataBuilder)):
                 if for_cudagraph_capture:
@@ -5131,6 +5138,9 @@ class NPUModelRunner(GPUModelRunner):
                     native.warming = False
                 if not native.ready:
                     raise RuntimeError("Native FULL startup capture did not seal its registry")
+                native_mtp = getattr(self.drafter, "native_mtp", None)
+                if native_mtp is not None and not native_mtp.ready:
+                    raise RuntimeError("Native MTP startup capture did not seal its draft registry")
                 cuda_graph_size = free_before - torch.npu.mem_get_info()[0]
             else:
                 cuda_graph_size = GPUModelRunner.capture_model(self)

@@ -178,7 +178,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         native = getattr(layer_metadata, "native_full", None)
         if native is not None:
             # These are capture-time geometry choices, never live request counts.
-            if native.shape.width == 1 and not native.shape.fresh:
+            if not native.shape.fresh:
                 return self._forward_native_decode_graph(mixed_qkv, b, a, core_attn_out, layer_metadata)
             return self._forward_native_graph(mixed_qkv, b, a, core_attn_out, layer_metadata)
         return self._forward_compatibility(mixed_qkv, b, a, core_attn_out)
@@ -251,8 +251,21 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         core_attn_out.copy_(output.squeeze(0))
 
     def _forward_native_decode_graph(self, mixed_qkv, b, a, core_attn_out, metadata):
+        """Native one-token decode or four-token MTP verification.
+
+        The speculative native ops load the previous accepted checkpoint and
+        save every new checkpoint. Padded tail tokens never affect an earlier
+        real token or its saved state; the sampler consumes only real outputs.
+        """
         layout = metadata.native_full
-        slots = metadata.non_spec_state_indices_tensor
+        if layout.shape.width > 1:
+            slots = metadata.spec_state_indices_tensor
+            accepted = metadata.num_accepted_tokens
+            lengths = metadata.spec_decode_metadata.actual_seq_lengths
+        else:
+            slots = metadata.non_spec_state_indices_tensor
+            accepted = None
+            lengths = metadata.non_spec_decode_metadata.actual_seq_lengths
         conv_output = torch.zeros_like(mixed_qkv)
         conv_weights = self.conv1d.weight.view(self.conv1d.weight.size(0), self.conv1d.weight.size(2))
         torch.ops._C_ascend.npu_causal_conv1d_custom(
@@ -264,7 +277,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             query_start_loc_opt=layout.query_start,
             cache_indices_opt=slots,
             initial_state_mode_opt=None,
-            num_accepted_tokens_opt=None,
+            num_accepted_tokens_opt=accepted,
             activation_mode=int(bool(self.activation)),
             pad_slot_id=PAD_SLOT_ID,
             run_mode=1,
@@ -279,8 +292,9 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             beta=beta.squeeze(0),
             state=self.kv_cache[1],
             scale=k.shape[-1] ** -0.5,
-            actual_seq_lengths=metadata.non_spec_decode_metadata.actual_seq_lengths,
-            ssm_state_indices=slots,
+            actual_seq_lengths=lengths,
+            ssm_state_indices=slots.flatten(),
+            num_accepted_tokens=accepted,
         )
         core_attn_out.copy_(output)
 
