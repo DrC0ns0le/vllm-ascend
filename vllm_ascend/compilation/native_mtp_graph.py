@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Static Qwen3.5 MTP graphs: one padded first pass and two skinny passes.
+"""Static Qwen3.5 MTP graphs: one padded first pass and subsequent skinny passes.
 
-The three model passes, LM heads, greedy draft selection and draft KV updates
+The model passes, LM heads, greedy draft selection and draft KV updates
 are captured together. Target rejection sampling remains owned by vLLM.
 """
 
@@ -34,22 +34,24 @@ class NativeMTPEntry(NativeFullEntry):
     def execute(self, proposer):
         self.prepare()
         context = get_forward_context()
-        with native_context(context, self.metadata, self.shape.tokens):
+        with native_context(context, self.metadata, self.shape.tokens, lora=self.lora):
             hidden = proposer.model(
                 input_ids=self.input_ids,
                 positions=self.positions,
                 hidden_states=self.hidden_states,
                 inputs_embeds=None,
             )
-        hidden = hidden.index_select(0, self.sample_indices)
-        positions = self.positions.index_select(-1, self.sample_indices)
-        token_ids = proposer.compute_draft_token_ids(hidden)
+            hidden = hidden.index_select(0, self.sample_indices)
+            positions = self.positions.index_select(-1, self.sample_indices)
+            token_ids = proposer.compute_draft_token_ids(hidden)
         drafts = [token_ids]
         for index, step in enumerate(self.next_steps):
             # Rejected first-pass tokens never extend the draft context. The
             # first pass's length ends at the sampler's last accepted token.
             step.contexts.copy_(torch.where(self.active, self.contexts + self.lengths + index, 0))
             step.lengths.copy_(self.active)
+            for mapping, first in zip(step.lora, self.lora, strict=True):
+                mapping.next_draft(first, self.active)
             step.prepare()
             for metadata in {id(m): m for m in step.metadata.values()}.values():
                 logical_positions = step.contexts
@@ -59,11 +61,11 @@ class NativeMTPEntry(NativeFullEntry):
                 metadata.slot_mapping.copy_(torch.where(self.active, slots, -1))
             positions = positions + 1
             positions = torch.where(positions < self.max_model_len, positions, 0)
-            with native_context(context, step.metadata, step.shape.tokens):
+            with native_context(context, step.metadata, step.shape.tokens, lora=step.lora):
                 hidden = proposer.model(
                     input_ids=token_ids, positions=positions, hidden_states=hidden, inputs_embeds=None
                 )
-            token_ids = proposer.compute_draft_token_ids(hidden)
+                token_ids = proposer.compute_draft_token_ids(hidden)
             drafts.append(token_ids)
         return torch.stack(drafts, dim=1)
 
@@ -90,6 +92,8 @@ class NativeMTPEntry(NativeFullEntry):
         )
         self.hidden_states.copy_(inputs["hidden_states"].index_select(0, tokens))
         valid = (torch.arange(width, device=rows.device)[None, :] < self.lengths[:, None]).reshape(-1)
+        for mapping in self.lora:
+            mapping.mask_padding(valid)
         for metadata in {id(m): m for m in self.metadata.values()}.values():
             metadata.slot_mapping.masked_fill_(~valid, -1)
         return rows[: sum(item is not None for item in items)]
@@ -104,11 +108,12 @@ class NativeMTPGraphCache(NativeFullGraphCache):
         super().__init__(config)
         self.proposer = proposer
         if (
-            self.num_speculative_tokens != 3
+            config.speculative_config.method not in ("mtp", "qwen3_5_mtp")
+            or self.num_speculative_tokens not in (1, 2, 3)
             or proposer.model_returns_tuple()
             or not proposer.pass_hidden_states_to_model
         ):
-            raise ValueError("Native MTP graphs require the Qwen3.5 hidden-state MTP interface and three draft tokens")
+            raise ValueError("Native MTP graphs require the Qwen3.5 hidden-state MTP interface and 1/2/3 draft tokens")
         # Draft layers are full attention; MegaGDN remains a target-prefill option.
         self.backend = "ascendc"
         self.megagdn_workspace = None
@@ -138,7 +143,7 @@ class NativeMTPGraphCache(NativeFullGraphCache):
         ):
             raise ValueError("Native MTP needs scheduler CPU request boundaries and prefill flags")
         lengths = lengths_cpu[: common.num_reqs].tolist()
-        # Reserve room for the remaining two draft KV writes in the captured
+        # Reserve room for the remaining draft KV writes in the captured
         # dense attention capacity. Outside it, use the existing proposer.
         if any(total + self.num_speculative_tokens - 1 > self.plan.max_context for total in lengths):
             self.compatibility_steps += 1

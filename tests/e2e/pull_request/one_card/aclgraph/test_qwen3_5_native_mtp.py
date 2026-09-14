@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""External 910B gate for Qwen3.5 MTP=3 capture, rejection and mixed arrivals."""
+"""External 910B gate for Qwen3.5 speculation, rejection and mixed arrivals."""
 
 import pytest
 import torch
@@ -10,16 +10,22 @@ from tests.e2e.conftest import VllmRunner, wait_until_npu_memory_free
 
 def mtp_registry_status(worker):
     runner = worker.model_runner
-    target, draft = runner.model.native_full, runner.drafter.native_mtp
+    target = runner.model.native_full
+    caches = {"target": target}
+    draft = getattr(runner.drafter, "native_mtp", None)
+    if draft is not None:
+        caches["draft"] = draft
     return {
         name: dict(
             ready=cache.ready,
             entries=sorted((s.requests, s.width, s.fresh) for s in cache.entries),
             fresh_replays=sum(e.replays for s, e in cache.entries.items() if s.fresh),
-            verify_replays=sum(e.replays for s, e in cache.entries.items() if not s.fresh and s.width == 4),
+            verify_replays=sum(
+                e.replays for s, e in cache.entries.items() if not s.fresh and s.width == cache.plan.decode_width
+            ),
             compatibility_steps=cache.compatibility_steps,
         )
-        for name, cache in (("target", target), ("draft", draft))
+        for name, cache in caches.items()
     }
 
 
@@ -58,7 +64,8 @@ def mtp_arrivals(llm):
 @wait_until_npu_memory_free()
 @pytest.mark.parametrize("model", ["Qwen/Qwen3.5-2B", "Qwen/Qwen3.5-4B"])
 @pytest.mark.parametrize("backend", ["ascendc", "megagdn"])
-def test_qwen3_5_native_mtp_three_startup_replay_and_accuracy(monkeypatch, capfd, model, backend):
+@pytest.mark.parametrize("method,count", [("mtp", 1), ("mtp", 2), ("mtp", 3), ("ngram", 3), ("ngram_gpu", 3)])
+def test_qwen3_5_native_speculation_startup_replay_and_accuracy(monkeypatch, capfd, model, backend, method, count):
     if not torch.npu.is_available() or "910B" not in torch.npu.get_device_name():
         pytest.skip("Requires Ascend 910B and Qwen3.5 weights including the MTP head")
     monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", "1")
@@ -81,7 +88,9 @@ def test_qwen3_5_native_mtp_three_startup_replay_and_accuracy(monkeypatch, capfd
         stop_prompt = {"prompt_token_ids": [1]}
         stop_sampling = SamplingParams(temperature=0, max_tokens=16, stop_token_ids=[expected["0"][0]])
         expected_stop = runner.model.generate([stop_prompt], stop_sampling, use_tqdm=False)[0].outputs[0].token_ids
-    speculation = dict(method="mtp", num_speculative_tokens=3)
+    speculation = dict(method=method, num_speculative_tokens=count)
+    if method in ("ngram", "ngram_gpu"):
+        speculation.update(prompt_lookup_min=1, prompt_lookup_max=3)
     with VllmRunner(model, enforce_eager=True, speculative_config=speculation, **options) as runner:
         assert mtp_arrivals(runner.model) == expected
     capfd.readouterr()
@@ -93,10 +102,13 @@ def test_qwen3_5_native_mtp_three_startup_replay_and_accuracy(monkeypatch, capfd
         compilation_config={"cudagraph_mode": "FULL", "cudagraph_capture_sizes": [1, 64, 128, 196, 384, 768]},
     ) as runner:
         startup = capfd.readouterr()
-        assert "Native MTP registry sealed:" in startup.out + startup.err
+        assert "Native FULL registry sealed:" in startup.out + startup.err
+        if method == "mtp":
+            assert "Native MTP registry sealed:" in startup.out + startup.err
         before = runner.model.collective_rpc(mtp_registry_status)[0]
         assert all(cache["ready"] for cache in before.values())
-        assert all(any(width == 4 and not fresh for _, width, fresh in c["entries"]) for c in before.values())
+        assert set(before) == ({"target", "draft"} if method == "mtp" else {"target"})
+        assert all(any(width == count + 1 and not fresh for _, width, fresh in c["entries"]) for c in before.values())
         for _ in range(2):
             assert mtp_arrivals(runner.model) == expected
             assert (
@@ -114,18 +126,19 @@ def test_qwen3_5_native_mtp_three_startup_replay_and_accuracy(monkeypatch, capfd
 
 
 @pytest.mark.parametrize("value_heads", [16, 32])
-def test_native_mtp_three_recurrence_graph_checkpoint_selection(value_heads):
+@pytest.mark.parametrize("width", [2, 3, 4, 16])
+def test_native_speculative_recurrence_graph_checkpoint_selection(value_heads, width):
     if not torch.npu.is_available():
         pytest.skip("Requires NPU and native recurrent_gated_delta_rule")
     torch.manual_seed(27)
-    count, width, heads, dim = 4, 4, 16, 128
+    count, heads, dim = 4, 16, 128
     tokens = count * width
     q = torch.nn.functional.normalize(torch.randn(tokens, heads, dim), dim=-1).bfloat16()
     k = torch.nn.functional.normalize(torch.randn_like(q.float()), dim=-1).bfloat16()
     v = torch.randn(tokens, value_heads, dim).bfloat16()
     g = -torch.rand(tokens, value_heads)
     beta = torch.rand(tokens, value_heads).bfloat16()
-    expected_state = torch.randn(24, value_heads, dim, dim) * 0.1
+    expected_state = torch.randn(tokens + 8, value_heads, dim, dim) * 0.1
     state = expected_state.npu()
     qn, kn, vn, gn, bn = (tensor.npu() for tensor in (q, k, v, g, beta))
     q = q.repeat_interleave(value_heads // heads, dim=1).float()
@@ -159,7 +172,8 @@ def test_native_mtp_three_recurrence_graph_checkpoint_selection(value_heads):
     torch.npu.current_stream().wait_stream(stream)
     checkpoints = torch.randperm(expected_state.shape[0])[:tokens].reshape(count, width)
     # All acceptance lengths, reordered requests, padding and recycled slots.
-    for iteration, requests in enumerate(([0, 1, 2, 3], [3, 1, 0], [2], [], [1, 3, 0, 2])):
+    cases = [[0, 1, 2, 3]] * width + [[3, 1, 0], [2], [], [1, 3, 0, 2]]
+    for iteration, requests in enumerate(cases):
         slot_cpu = torch.full((count, width), -1, dtype=torch.int32)
         accepted_cpu = torch.ones(count, dtype=torch.int32)
         expected = torch.zeros_like(v.float())
@@ -183,11 +197,12 @@ def test_native_mtp_three_recurrence_graph_checkpoint_selection(value_heads):
         torch.testing.assert_close(state.cpu(), expected_state, rtol=1e-2, atol=1e-3)
 
 
-def test_native_mtp_three_convolution_graph_acceptance_and_padding():
+@pytest.mark.parametrize("width", [2, 3, 4, 16])
+def test_native_speculative_convolution_graph_acceptance_and_padding(width):
     if not torch.npu.is_available():
         pytest.skip("Requires NPU and native causal_conv1d")
     torch.manual_seed(31)
-    count, width, channels, history = 4, 4, 128, 3
+    count, channels, history = 4, 128, 3
     x = torch.randn(count, width, channels).bfloat16()
     weight = (torch.randn(history + 1, channels) * 0.1).bfloat16()
     expected_cache = torch.randn(7, history + width - 1, channels).bfloat16()
@@ -222,7 +237,8 @@ def test_native_mtp_three_convolution_graph_acceptance_and_padding():
         with torch.npu.graph(graph, stream=stream):
             run()
     torch.npu.current_stream().wait_stream(stream)
-    for iteration, indices in enumerate(([5, 2, 6, 1], [2, -1, 5, -1], [-1] * 4, [1, 6, 2, 5])):
+    cases = [[5, 2, 6, 1]] * width + [[2, -1, 5, -1], [-1] * 4, [1, 6, 2, 5]]
+    for iteration, indices in enumerate(cases):
         accepted_cpu = 1 + (torch.arange(count, dtype=torch.int32) + iteration) % width
         expected_outputs = {}
         for row, slot in enumerate(indices):

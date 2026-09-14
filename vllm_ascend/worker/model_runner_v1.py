@@ -133,6 +133,7 @@ from vllm_ascend.compilation.acl_graph import (
     update_full_graph_params,
 )
 from vllm_ascend.compilation.breakable_aclgraph import BreakableACLGraphWrapper
+from vllm_ascend.compilation.native_full_graph import native_full_requested
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_cache_layout import (
     apply_layerwise_kv_cache_plan,
 )
@@ -3822,7 +3823,7 @@ class NPUModelRunner(GPUModelRunner):
                 and self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
                 and not self.model_config.enforce_eager
             ):
-                if self.speculative_config is not None:
+                if self.speculative_config is not None and not native_full_requested(self.vllm_config):
                     raise ValueError("MRV1 breakable ACLGraph backport does not support speculative decoding.")
                 logger.info(
                     "Breakable ACLGraph config: dtype=%s mamba_cache_mode=%s prefix_caching=%s "

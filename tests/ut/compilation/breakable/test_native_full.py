@@ -10,7 +10,7 @@ import copy
 import importlib.util
 import random
 import sys
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from enum import Enum
 from math import prod
@@ -53,6 +53,11 @@ class AscendMetadata(SimpleNamespace):
 
 
 def load_runtime():
+    lora_path = ROOT / "vllm_ascend/compilation/native_lora.py"
+    lora_tree = ast.parse(lora_path.read_text())
+    lora_tree.body = [n for n in lora_tree.body if not isinstance(n, (ast.Import, ast.ImportFrom))]
+    lora_namespace = dict(torch=torch, contextmanager=contextmanager)
+    exec(compile(lora_tree, str(lora_path), "exec"), lora_namespace)
     workspace_path = ROOT / "vllm_ascend/ops/pto_chunk_gdn/workspace.py"
     workspace_tree = ast.parse(workspace_path.read_text())
     workspace_tree.body = [n for n in workspace_tree.body if not isinstance(n, (ast.Import, ast.ImportFrom))]
@@ -65,6 +70,9 @@ def load_runtime():
         torch=torch,
         copy=copy,
         contextmanager=contextmanager,
+        ExitStack=ExitStack,
+        NativeGraphLoRA=lora_namespace["NativeGraphLoRA"],
+        native_lora_wrappers=lora_namespace["native_lora_wrappers"],
         SimpleNamespace=SimpleNamespace,
         CUDAGraphMode=Mode,
         BatchDescriptor=lambda **kwargs: SimpleNamespace(**kwargs),
@@ -338,9 +346,7 @@ def test_serving_replays_sealed_entries_without_recapture_and_scatter_is_ordered
     assert before == [entry.replays for entry in owner.entries.values()]
 
 
-@pytest.mark.parametrize(
-    "field,value", [("speculative_config", object()), ("lora_config", object()), ("kv_transfer_config", object())]
-)
+@pytest.mark.parametrize("field,value", [("speculative_config", object()), ("kv_transfer_config", object())])
 def test_unsupported_configuration_fails_before_warmup(field, value):
     runtime = load_runtime()
     cfg = config()
@@ -367,13 +373,28 @@ def test_native_cache_gather_never_reads_invalid_pages_or_propagates_padding_nan
 
 
 @pytest.mark.parametrize("backend", ["ascendc", "megagdn"])
-def test_startup_captures_all_geometries_once_without_touching_live_state(monkeypatch, backend):
+@pytest.mark.parametrize("with_lora", [False, True])
+def test_startup_captures_all_geometries_once_without_touching_live_state(monkeypatch, backend, with_lora):
     runtime = load_runtime()
     cfg = config()
     cfg.scheduler_config.max_num_seqs = 2
     cfg.scheduler_config.max_num_batched_tokens = 8
     cfg.compilation_config.cudagraph_capture_sizes = [1, 4, 8]
     cfg.additional_config["native_full_graph_backend"] = backend
+    punica = None
+    if with_lora:
+        cfg.lora_config = SimpleNamespace(max_lora_rank=8, fully_sharded_loras=False)
+        punica = SimpleNamespace(
+            _token_lora_indices=torch.full((8,), -1, dtype=torch.int64),
+            _embeddings_indices=torch.zeros(8, dtype=torch.int64),
+            _sampler_indices=torch.full((8,), -1, dtype=torch.int64),
+            _sampler_indices_padded=torch.arange(8),
+            indices_len=[1, 1, 1, 1],
+            is_prefill=True,
+            no_lora=True,
+            enable_native_full_graph=Mock(),
+        )
+        original_lora = vars(punica).copy()
     owner = runtime.NativeFullGraphCache(cfg)
     context = sources()
     state = torch.ones(2, 2, 2)
@@ -413,6 +434,11 @@ def test_startup_captures_all_geometries_once_without_touching_live_state(monkey
             if type(m).__name__ == "GDNAttentionMetadata"
         )
         native = context.attn_metadata["gdn0"].native_full
+        assert context.batch_descriptor.has_lora == with_lora
+        if with_lora:
+            assert not punica.no_lora and not punica.is_prefill
+            assert punica._token_lora_indices is native.lora[0].tokens
+            assert punica._token_lora_indices.numel() == native.shape.tokens
         assert native.megagdn_workspace is owner.megagdn_workspace
         if backend == "megagdn" and native.shape.fresh:
             native.megagdn_workspace.views(
@@ -426,11 +452,15 @@ def test_startup_captures_all_geometries_once_without_touching_live_state(monkey
         return kwargs["input_ids"][:, None].float()
 
     old = vars(context).copy()
+    model.modules = lambda: [SimpleNamespace(punica_wrapper=punica)] * 2
     owner.warmup(context, inputs(1), model)
     assert owner.ready and set(owner.entries) == set(owner.plan.shapes)
     assert events.count("capture") == len(owner.plan.shapes)
     assert state.eq(1).all()
     assert vars(context) == old
+    if with_lora:
+        punica.enable_native_full_graph.assert_called_once()
+        assert all(getattr(punica, name) is value for name, value in original_lora.items())
     if backend == "megagdn":
         assert owner.megagdn_workspace.sealed and owner.megagdn_workspace.reserved_bytes > 0
         assert len(owner.megagdn_workspace.buffers) == 1

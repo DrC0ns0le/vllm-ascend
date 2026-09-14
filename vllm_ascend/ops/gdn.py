@@ -251,7 +251,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         core_attn_out.copy_(output.squeeze(0))
 
     def _forward_native_decode_graph(self, mixed_qkv, b, a, core_attn_out, metadata):
-        """Native one-token decode or four-token MTP verification.
+        """Native one-token decode or padded speculative verification.
 
         The speculative native ops load the previous accepted checkpoint and
         save every new checkpoint. Padded tail tokens never affect an earlier

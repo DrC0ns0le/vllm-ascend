@@ -6,7 +6,7 @@ admission, or per-layer Python callbacks. Graphs own all mutable replay inputs.
 """
 
 import copy
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from types import SimpleNamespace
 
 import torch
@@ -21,6 +21,7 @@ from vllm_ascend.compilation.native_full_layout import (
     cached_attention_mask,
     padded_token_indices,
 )
+from vllm_ascend.compilation.native_lora import NativeGraphLoRA, native_lora_wrappers
 from vllm_ascend.ops.gdn_attn_builder import (
     GDNCausalConv1dMetadata,
     GDNDecodeMetadata,
@@ -49,22 +50,31 @@ def native_full_speculative_tokens(config):
     spec = config.speculative_config
     if spec is None:
         return 0
+    method = getattr(spec, "method", None)
+    count = getattr(spec, "num_speculative_tokens", None)
+    # recurrent_gated_delta_rule.h reserves MAX_MTP=16 checkpoints,
+    # including the target token. MTP's supported rollout is 1/2/3 drafts.
+    max_drafts = 15 if method in ("ngram", "ngram_gpu") else 3
     if (
-        getattr(spec, "method", None) not in ("mtp", "qwen3_5_mtp")
-        or getattr(spec, "num_speculative_tokens", None) != 3
+        method not in ("mtp", "qwen3_5_mtp", "ngram", "ngram_gpu")
+        or type(count) is not int
+        or not 1 <= count <= max_drafts
         or getattr(spec, "parallel_drafting", False)
     ):
-        raise ValueError("Native Qwen3.5 FULL speculation requires autoregressive MTP with num_speculative_tokens=3")
-    return spec.num_speculative_tokens
+        raise ValueError(
+            "Native Qwen3.5 FULL supports autoregressive MTP with num_speculative_tokens=1/2/3 "
+            "or ngram/ngram_gpu with 1-15 speculative tokens"
+        )
+    return count
 
 
 @contextmanager
-def native_context(context, metadata, tokens, mode=CUDAGraphMode.FULL):
+def native_context(context, metadata, tokens, mode=CUDAGraphMode.FULL, lora=()):
     fields = dict(
         attn_metadata=metadata,
         cudagraph_runtime_mode=mode,
         capturing=False,
-        batch_descriptor=BatchDescriptor(num_tokens=tokens),
+        batch_descriptor=BatchDescriptor(num_tokens=tokens, has_lora=bool(lora)),
     )
     for name in ("num_tokens", "padded_num_tokens", "num_actual_tokens"):
         if hasattr(context, name):
@@ -73,7 +83,10 @@ def native_context(context, metadata, tokens, mode=CUDAGraphMode.FULL):
     try:
         for name, value in fields.items():
             setattr(context, name, value)
-        yield
+        with ExitStack() as stack:
+            for mapping in lora:
+                stack.enter_context(mapping.bind())
+            yield
     finally:
         for name, value in saved.items():
             setattr(context, name, value)
@@ -91,6 +104,7 @@ class NativeFullEntry:
         device = inputs["positions"].device
         count, width = shape.requests, shape.width
         tokens = shape.tokens
+        self.lora = tuple(NativeGraphLoRA(wrapper, shape) for wrapper in owner.lora_wrappers)
         self.input_ids = torch.zeros(tokens, dtype=inputs["input_ids"].dtype, device=device)
         self.positions = torch.zeros(
             (*inputs["positions"].shape[:-1], tokens), dtype=inputs["positions"].dtype, device=device
@@ -229,6 +243,8 @@ class NativeFullEntry:
         self.input_ids.copy_(inputs["input_ids"].index_select(0, tokens))
         self.positions.copy_(inputs["positions"].index_select(-1, tokens))
         valid = (torch.arange(self.shape.width, device=device)[None, :] < lengths[:, None]).reshape(-1)
+        for mapping in self.lora:
+            mapping.update(tokens, valid)
         seen = set()
         for name, target in self.metadata.items():
             if id(target) in seen:
@@ -243,13 +259,13 @@ class NativeFullEntry:
                 target.non_spec_state_indices_tensor.copy_(torch.where(lengths > 0, slots, -1))
                 if not self.shape.fresh and width > 1:
                     if all_states is None or all_states.shape[1] < width:
-                        raise ValueError("Native MTP requires four physical recurrent checkpoints per request")
+                        raise ValueError(f"Native verification requires {width} recurrent checkpoints per request")
                     target.spec_state_indices_tensor.copy_(
                         torch.where(lengths[:, None] > 0, all_states[:, :width].index_select(0, rows), -1)
                     )
                     accepted = source.native_num_accepted_tokens
                     if accepted is None:
-                        raise ValueError("Native MTP verification requires scheduler accepted-token counts")
+                        raise ValueError("Native verification requires scheduler accepted-token counts")
                     target.num_accepted_tokens.copy_(torch.where(lengths > 0, accepted.index_select(0, rows), 1))
             else:
                 # Async speculation may leave optimistic CPU sequence lengths.
@@ -280,6 +296,7 @@ class NativeFullGraphCache:
         self.entries = {}
         self.compatibility_steps = 0
         self.megagdn_workspace = None
+        self.lora_wrappers = ()
         if not self.enabled:
             return
         self.num_speculative_tokens = native_full_speculative_tokens(config)
@@ -300,13 +317,20 @@ class NativeFullGraphCache:
             )
             or config.cache_config.mamba_cache_mode != "none"
             or config.kv_transfer_config is not None
-            or config.lora_config is not None
             or getattr(config.quant_config, "enable_c8_quant", False)
         ):
             raise ValueError(
-                "Native Qwen3.5 FULL requires single-rank execution, mamba_cache_mode=none, "
-                "and no LoRA, KV transfer or C8"
+                "Native Qwen3.5 FULL requires single-rank execution, mamba_cache_mode=none, and no KV transfer or C8"
             )
+        if config.lora_config is not None and (
+            config.lora_config.max_lora_rank not in (8, 16, 32, 64) or config.lora_config.fully_sharded_loras
+        ):
+            raise ValueError("Native FULL LoRA requires unsharded adapters with max_lora_rank=8/16/32/64")
+        if config.lora_config is not None:
+            lora_dtype = getattr(config.lora_config, "lora_dtype", "auto")
+            model_dtype = getattr(config.model_config, "dtype", None)
+            if lora_dtype != "auto" and model_dtype is not None and lora_dtype != model_dtype:
+                raise ValueError("Native FULL LoRA weights must use the model dtype; use lora_dtype=auto")
         capacity = (config.additional_config or {}).get(
             "native_full_graph_max_context", min(config.model_config.max_model_len, DEFAULT_NATIVE_FULL_MAX_CONTEXT)
         )
@@ -346,7 +370,12 @@ class NativeFullGraphCache:
                 if type(metadata).__name__ == "GDNAttentionMetadata":
                     states = getattr(metadata, "native_state_indices", None)
                     if states is None or states.ndim != 2 or states.shape[1] < self.plan.decode_width:
-                        raise ValueError("Native MTP capture requires four scheduler-owned recurrent checkpoints")
+                        raise ValueError(
+                            f"Native capture requires {self.plan.decode_width} scheduler-owned recurrent checkpoints"
+                        )
+        if self.config.lora_config is not None:
+            model = runnable if self.requires_gdn else runnable.model
+            self.lora_wrappers = native_lora_wrappers(model, required=self.requires_gdn)
         # Warmup uses -1 write slots and zero-length decode rows. It never
         # reads/writes scheduler-owned recurrent state.
         stream = torch.npu.Stream()
@@ -358,7 +387,7 @@ class NativeFullGraphCache:
                 # Largest first permits later graphs to reuse the allocator pool.
                 for shape in sorted(self.plan.shapes, key=lambda s: s.tokens, reverse=True):
                     entry = self.entry_type(self, shape, context, inputs)
-                    with native_context(context, entry.metadata, shape.tokens):
+                    with native_context(context, entry.metadata, shape.tokens, lora=entry.lora):
                         entry.execute(runnable)
                         stream.synchronize()
                         entry.graph = torch.npu.NPUGraph()
@@ -423,7 +452,7 @@ class NativeFullGraphCache:
             gdn = next(m for m in context.attn_metadata.values() if type(m).__name__ == "GDNAttentionMetadata")
             flags = gdn.native_is_prefilling
             if flags is None or flags.device.type != "cpu":
-                raise ValueError("Native MTP requires scheduler CPU prefill/decode classification")
+                raise ValueError("Native verification requires scheduler CPU prefill/decode classification")
             is_prefilling = flags[: len(lengths)].tolist()
         batches = self.plan.batches(boundaries, lengths, is_prefilling)
         if batches is None:

@@ -22,6 +22,7 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         PunicaWrapperBase.__init__(self, max_num_batched_tokens, max_batches, device)
         refresh_all_lora_classes()
         self.lora_config = kwargs.get("lora_config")
+        self._native_full_graph = False
         ascend_device_type = get_ascend_device_type()
         if ascend_device_type == AscendDeviceType._310P or (
             self.lora_config is not None and self.lora_config.max_lora_rank >= 128
@@ -66,6 +67,29 @@ class PunicaWrapperNPU(PunicaWrapperBase):
                 dtype=lora_dtype,
                 device=device,
             )
+
+    def enable_native_full_graph(self):
+        # The 910B native BGMV ABI supports ranks 8/16/32/64. Higher ranks
+        # select torch_ops with data-dependent indexing, which cannot replay
+        # with a changed adapter mapping. Reject them before graph capture.
+        if (
+            get_ascend_device_type() != AscendDeviceType.A2
+            or self.lora_config is None
+            or self.lora_config.max_lora_rank not in (8, 16, 32, 64)
+            or self.lora_config.fully_sharded_loras
+        ):
+            raise ValueError("Native FULL LoRA requires 910B native BGMV and unsharded ranks 8/16/32/64")
+        self._native_full_graph = True
+
+    def update_metadata(self, mapping, lora_index_to_id, max_loras, vocab_size, **kwargs):
+        if self._native_full_graph:
+            # Per-token BGMV also handles prefill/compatibility. Avoid the
+            # unique_consecutive/item() prefill grouping and its device waits.
+            self._update_base_metadata(mapping, lora_index_to_id, max_loras, vocab_size)
+            self.is_prefill = False
+            self.no_lora = False
+            return
+        return super().update_metadata(mapping, lora_index_to_id, max_loras, vocab_size, **kwargs)
 
     def _update_base_metadata(
         self,

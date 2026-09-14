@@ -368,7 +368,11 @@ at::Tensor bgmv_expand(at::Tensor &x, at::Tensor &weight, at::Tensor &indices, a
     TORCH_CHECK(indices.dim() == 1, "indices should be [batch_size]");
     TORCH_CHECK(x.size(0) == y.size(0) && x.size(0) == indices.size(0),
                 "the first dimension of x, y, indices should be same");
-    TORCH_CHECK(x.size(1) <= slice_size, "hidden in should be smaller than hidden out");
+    // GDN's BA projections can be narrower than the configured LoRA rank.
+    // Expansion reduces over rank independently for every output channel;
+    // the native kernel's restriction is on rank, not output width.
+    TORCH_CHECK(x.size(1) == 8 || x.size(1) == 16 || x.size(1) == 32 || x.size(1) == 64,
+                "native LoRA expand supports ranks 8, 16, 32, 64");
     TORCH_CHECK(slice_offset >= 0, "slice offset should be no smaller than 0");
     TORCH_CHECK((slice_size + slice_offset) <= y.size(1),
                 "slice_size + slice_offset should be smaller than the second dimension of y")
@@ -453,7 +457,9 @@ at::Tensor sgmv_expand(at::Tensor &x, at::Tensor &weight, at::Tensor &lora_indic
     TORCH_CHECK(weight.dim() == 3 || weight.dim() == 4,
                 "weight should be [num_loras, hidden_out, hidden_in] or [num_loras, 1, hidden_out, hidden_in]");
     TORCH_CHECK(y.dim() == 2, "y should be [batch_size, hidden_out]");
-    TORCH_CHECK(x.size(1) <= slice_size, "hidden in should be smaller than hidden out");
+    // As for BGMV, narrow GDN BA outputs may be smaller than the LoRA rank.
+    TORCH_CHECK(x.size(1) == 8 || x.size(1) == 16 || x.size(1) == 32 || x.size(1) == 64,
+                "native LoRA expand supports ranks 8, 16, 32, 64");
     TORCH_CHECK(slice_offset >= 0, "slice offset should be no smaller than 0");
     TORCH_CHECK((slice_size + slice_offset) <= y.size(1),
                 "slice_size + slice_offset should be smaller than the second dimension of y")
