@@ -152,6 +152,7 @@ from vllm_ascend.compilation.acl_graph import (
     update_full_graph_params,
 )
 from vllm_ascend.compilation.breakable_aclgraph import BreakableACLGraphWrapper
+from vllm_ascend.compilation.native_prefill_graph import NativePrefillGraphCache
 from vllm_ascend.core.kv_cache_interface import is_circular_kv_cache_spec
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h import get_prebound_copy_sfa_slots
@@ -3241,6 +3242,16 @@ class NPUModelRunner(GPUModelRunner):
         run_model = partial(self.model, **model_inputs)
 
         try:
+            native_prefill = getattr(self, "native_prefill_graph", None)
+            if native_prefill is not None and native_prefill.enabled:
+                if native_prefill.warming:
+                    runnable = self.model
+                    if isinstance(runnable, (ACLGraphWrapper, BreakableACLGraphWrapper)):
+                        runnable = runnable.unwrap()
+                    return native_prefill.warmup(forward_context, model_inputs, runnable)
+                prefill_output = native_prefill.replay(forward_context, model_inputs)
+                if prefill_output is not None:
+                    return prefill_output
             if self.enable_enpu:
                 # The soft segmentation scenario requires event.record first, then event.wait
                 self._update_full_graph_params_if_needed(forward_context, num_tokens_padded)
@@ -4503,6 +4514,7 @@ class NPUModelRunner(GPUModelRunner):
         ) # type: bool
 
         # wrap the model with full graph wrapper if needed.
+        self.native_prefill_graph = NativePrefillGraphCache(self.vllm_config)
         cudagraph_mode = self.compilation_config.cudagraph_mode
         assert cudagraph_mode is not None
 
@@ -6611,6 +6623,17 @@ class NPUModelRunner(GPUModelRunner):
         try:
             with _torch_cuda_wrapper(), _replace_gpu_model_runner_function_wrapper(parent_module_name):
                 cuda_graph_size = GPUModelRunner.capture_model(self)
+                native_prefill = getattr(self, "native_prefill_graph", None)
+                if native_prefill is not None and native_prefill.enabled:
+                    free_before, _ = torch.npu.mem_get_info()
+                    native_prefill.warming = True
+                    try:
+                        self._dummy_run(1, force_attention=True, cudagraph_runtime_mode=CUDAGraphMode.NONE)
+                    finally:
+                        native_prefill.warming = False
+                    if not native_prefill.ready:
+                        raise RuntimeError("Native prefill startup capture did not seal its registry")
+                    cuda_graph_size += free_before - torch.npu.mem_get_info()[0]
         finally:
             self._engram_capture_active = False
 

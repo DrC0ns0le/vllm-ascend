@@ -41,12 +41,14 @@ from vllm_ascend.attention.utils import (
     maybe_save_kv_layer_to_connector,
     wait_for_kv_layer_from_connector,
 )
+from vllm_ascend.compilation.native_prefill_layout import fresh_conv_history, neutral_gdn_padding
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import record_attention_compute_start
 from vllm_ascend.ops.gdn_attn_builder import AscendGDNFusedAttentionBackend
 from vllm_ascend.ops.triton.fla.chunk import chunk_gated_delta_rule
 from vllm_ascend.ops.triton.fla.fused_qkvzba_split_reshape import fused_qkvzba_split_reshape_cat
+from vllm_ascend.ops.triton.fla.prefill_state_writeback import write_fresh_states
 from vllm_ascend.ops.triton.fla.utils import clear_ssm_states
 from vllm_ascend.ops.triton.mamba.causal_conv1d import extract_last_width
 from vllm_ascend.ops.triton.mamba.state_index import gather_ssm_states, scatter_ssm_states_
@@ -409,6 +411,67 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             output[:num_tokens] = out
         return out
 
+    def _forward_native_prefill(self, mixed_qkv, gate_b, gate_a, core_attn_out, metadata):
+        layout = metadata.native_prefill
+        slots = metadata.non_spec_state_indices_tensor
+        conv_cache, state_cache = self.kv_cache[:2]
+        conv_layer = _get_base_conv1d(self)
+        history = fresh_conv_history(
+            mixed_qkv.view(layout.shape.requests, layout.shape.width, -1),
+            layout.lengths,
+            conv_layer.weight.shape[-1] - 1,
+        )
+        scratch = conv_cache.new_zeros((layout.shape.requests + 1, *conv_cache.shape[1:]))
+        conv_output = causal_conv1d_fn(
+            mixed_qkv,
+            _get_packed_conv_weights(self),
+            conv_layer.bias,
+            conv_states=scratch,
+            query_start_loc=layout.query_start,
+            cache_indices=layout.conv_indices,
+            has_initial_state=layout.has_initial_state,
+            activation="silu" if self.activation else None,
+            pad_slot_id=PAD_SLOT_ID,
+            null_block_id=0,
+            head_num=0,
+        )
+        write_fresh_states(history.contiguous(), conv_cache, slots)
+        query, key, value = self.rearrange_mixed_qkv(conv_output)
+        gate, beta = DeviceOperator.fused_gdn_gating(self.A_log, gate_a, gate_b, self.dt_bias)
+        query, key, value, gate, beta = neutral_gdn_padding(query, key, value, gate, beta, layout.valid)
+        initial_state = state_cache.new_zeros((layout.shape.requests, *state_cache.shape[1:]))
+        use_fla = get_current_hardware_profile().supports(HardwareCapability.FLA_GDN_PREFILL)
+        prefill_op = _get_fla_gdn_prefill_op() if use_fla else None
+        if prefill_op is not None:
+            output, final_state = DeviceOperator.fla_gdn_prefill(
+                q=query,
+                k=key,
+                v=value,
+                g=gate,
+                beta=beta,
+                initial_state=initial_state,
+                scale=key.shape[-1] ** -0.5,
+                prebuilt_meta=layout.chunk,
+                fused_fwd=prefill_op,
+            )
+        else:
+            output, final_state = chunk_gated_delta_rule(
+                q=query,
+                k=key,
+                v=value,
+                g=gate,
+                beta=beta,
+                initial_state=initial_state.transpose(-1, -2).contiguous(),
+                output_final_state=True,
+                cu_seqlens=layout.query_start,
+                prebuilt_meta=layout.chunk,
+                head_first=False,
+                use_qk_l2norm_in_kernel=True,
+            )
+            final_state = final_state.transpose(-1, -2)
+        write_fresh_states(final_state.contiguous(), state_cache, slots)
+        core_attn_out.copy_(output.squeeze(0))
+
     def _forward_core(
         self,
         mixed_qkv: torch.Tensor,
@@ -437,6 +500,8 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         assert isinstance(attn_metadata, dict)
         attn_metadata = attn_metadata[self.prefix]
         assert isinstance(attn_metadata, GDNAttentionMetadata)
+        if getattr(attn_metadata, "native_prefill", None) is not None:
+            return self._forward_native_prefill(mixed_qkv, b, a, core_attn_out, attn_metadata)
         spec_sequence_masks = attn_metadata.spec_sequence_masks
         spec_token_indx = attn_metadata.spec_token_indx
         non_spec_token_indx = attn_metadata.non_spec_token_indx

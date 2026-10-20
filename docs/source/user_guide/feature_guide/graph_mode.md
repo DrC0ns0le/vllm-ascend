@@ -400,6 +400,63 @@ outputs = llm.generate("Hello, how are you?")
 vllm serve path/to/your/model --enforce-eager
 ```
 
+## Padded Qwen3.5 prefill graphs on MRV1
+
+The optional `native_prefill_graph` registry ports the AscendC fresh-prefill
+padding from the v0.26 DSpark branch (`3a0a56477`) to v0.30. It captures complete
+model executions at startup for fixed request-count/query-width rectangles.
+Shorter requests and missing request rows are padded. Causal attention excludes
+future padding from real outputs; zero GDN gates and updates preserve the final
+recurrent state. Cache writes exclude padding, and convolution history ends at
+the last real token.
+
+This registry handles **fresh prefill-only batches**. Decode, mixed
+prefill/decode, continuing prompt chunks, prefix-cache hits, over-capacity
+requests, and unsupported model inputs keep the existing v0.30 execution path.
+Standard graph capture still runs at startup, including decode graphs. No
+decode, MTP, DSpark, LoRA, or MegaGDN implementation is imported from v0.26.
+
+The initial scope is dense, unquantized Qwen3.5 on Ascend 910B with MRV1,
+single-rank execution, `mamba_cache_mode=none`, and no speculative decoding,
+LoRA, or KV transfer. The captured input representation can be token IDs or
+precomputed embeddings, matching the runner's startup inputs. Other input
+representations fall back. Multimodal inference is not an acceptance target.
+
+For example:
+
+```bash
+VLLM_USE_V2_MODEL_RUNNER=0 vllm serve Qwen/Qwen3.5-2B \
+  --dtype bfloat16 \
+  --max-model-len 2048 \
+  --max-num-seqs 8 \
+  --max-num-batched-tokens 2048 \
+  --no-enable-prefix-caching \
+  --mamba-cache-mode none \
+  --compilation-config '{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[1,2,4,8,64,128,256,512,1024]}' \
+  --additional-config '{"native_prefill_graph":true,"native_prefill_graph_max_context":1024,"native_prefill_graph_request_counts":[1,2,4,8]}'
+```
+
+| Additional configuration | Default | Meaning |
+| --- | --- | --- |
+| `native_prefill_graph` | `false` | Enable startup capture of the prefill registry on MRV1. |
+| `native_prefill_graph_max_context` | `min(max_model_len, 1024)` | Maximum fresh query width; positive integer no larger than `max_model_len`. |
+| `native_prefill_graph_request_counts` | Powers of two up to `max_num_seqs`, plus `max_num_seqs` | Nonempty list of positive request counts no larger than `max_num_seqs`. |
+
+Widths come from `cudagraph_capture_sizes`, plus width one and the effective
+width ceiling. Every rectangle fits within `max_num_batched_tokens`; groups
+larger than a rectangle are split and their outputs restored to scheduler order.
+The registry is sealed before serving. It never captures a new graph during
+requests. More rectangles increase startup time and graph memory consumption.
+
+Check for `Native prefill registry sealed` at startup and, with debug logging,
+`Native prefill replay hit` during fresh requests. The CPU tests in
+`tests/ut/compilation/native_prefill/` cover geometry, neutral padding, owned
+metadata, replay, and decode exclusion. The real-weight acceptance test is
+`tests/e2e/pull_request/one_card/aclgraph/test_qwen3_5_native_prefill.py`; it compares
+generated tokens against standard v0.30 execution and tests masked state writes
+with padded physical cache strides. NPU correctness, memory use, and performance
+must be validated on the deployment hardware before claiming a speedup.
+
 ## References
 
 - [CUDA Graphs](https://docs.vllm.ai/en/latest/design/cuda_graphs/)
