@@ -28,7 +28,7 @@ logprob，再在标签间归一化。`label_mass` 是全部标签的全词表概
 - 默认关闭 thinking；显式启用返回 400。标签在当前回复位置必须是独立单 token。
 - 按上游 Qwen `NextTokenStrategy` 的行为，决策接口仅接受文本/JSON。
   图片、视频、音频、`joint=true` 均返回 400；这不改变模型原有聊天多模态能力。
-- 插件只挂载 generate 任务。不支持的架构或 logits 模式无法建立策略，接口返回 501。
+- Qwen 策略需要 generate 任务。不支持的架构或 logits 模式无法建立策略，接口返回 501。
   启动日志会说明原因。
 
 ## 环境准备

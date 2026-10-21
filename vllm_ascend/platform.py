@@ -319,6 +319,10 @@ class NPUPlatform(Platform):
 
         register_deepseek_v4_vision_config_convertor()
 
+        from vllm_ascend.patch.platform.patch_clef import register_clef_config_convertor
+
+        register_clef_config_convertor()
+
         # For online serving, "ascend" quantization method is not a choice natively,
         # so we need to add "ascend" quantization method to quantization methods list
         # and the user can enable quantization using "vllm serve --quantization ascend".

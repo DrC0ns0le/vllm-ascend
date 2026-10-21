@@ -46,6 +46,9 @@ from transformers.models.qwen2_vl.image_processing_qwen2_vl import (
     Qwen2VLImageProcessor,
     smart_resize,
 )
+from vllm.config import VllmConfig
+from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
+from vllm.model_executor.models.interfaces_base import default_pooling_type
 from vllm.model_executor.models.qwen3_5 import (
     Qwen3_5ForConditionalGeneration,
     Qwen3_5MoeForConditionalGeneration,
@@ -62,6 +65,8 @@ from vllm.model_executor.models.vision import (
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalFieldConfig
+
+from vllm_ascend.pooling.clef import JOINT_HEAD_WEIGHTS, JointSchemaHead, JointSchemaPooler, embed_lexical
 
 # Marker stored in the mm_kwargs dicts produced by select_encoder_cudagraph_items
 # once device-side preprocessing has been applied. The graph manager re-packs
@@ -402,3 +407,43 @@ class AscendQwen3_5ForConditionalGeneration(_AscendVLPreprocessMixin, Qwen3_5For
 )
 class AscendQwen3_5MoeForConditionalGeneration(_AscendVLPreprocessMixin, Qwen3_5MoeForConditionalGeneration):
     pass
+
+
+@default_pooling_type(tok_pooling_type="ALL")
+@MULTIMODAL_REGISTRY.register_processor(
+    AscendQwen3_5VLProcessor,
+    info=AscendQwen3_5ProcessingInfo,
+    dummy_inputs=Qwen3VLDummyInputsBuilder,
+)
+class AscendClefFlashForJointSchema(AscendQwen3_5ForConditionalGeneration):
+    """Clef-Flash's trained pooling head on the Ascend Qwen3.5 backbone."""
+
+    is_pooling_model = True
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        # All token states are needed by the head, including the state prefix.
+        if vllm_config.cache_config.enable_prefix_caching:
+            raise ValueError("Clef-Flash requires --no-enable-prefix-caching")
+        parallel = vllm_config.parallel_config
+        if parallel.pipeline_parallel_size > 1 or parallel.prefill_context_parallel_size > 1:
+            raise ValueError("Clef-Flash currently requires PP=1 and PCP=1")
+        super().__init__(vllm_config=vllm_config, prefix=prefix)
+        model_config = vllm_config.model_config
+        self.pooler = JointSchemaPooler(
+            JointSchemaHead(**model_config.hf_config.joint_head_config),
+            self._embed_lexical,
+        )
+        head = self.language_model.lm_head
+        if head.tp_size > 1 and head.output_reduce_group is None:
+            raise ValueError("Clef-Flash requires standard LM-head tensor parallelism")
+        self.secondary_weights = [
+            DefaultModelLoader.Source(
+                model_or_path=model_config.model,
+                revision=model_config.revision,
+                prefix="pooler.head.",
+                allow_patterns_overrides=[JOINT_HEAD_WEIGHTS],
+            )
+        ]
+
+    def _embed_lexical(self, token_ids: torch.Tensor) -> torch.Tensor:
+        return embed_lexical(self.language_model.lm_head, token_ids)

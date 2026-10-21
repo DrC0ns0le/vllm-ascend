@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""vLLM 0.30 endpoint plugin for the upstream next-token decision APIs."""
+"""vLLM 0.30 endpoint plugin for the upstream structured decision APIs."""
 
 from argparse import Namespace
 
@@ -20,7 +20,7 @@ from .openai.decisions.api_router import register_decisions_api_router
 
 class StructuredDecisionsPlugin:
     name = "ascend_structured_decisions"
-    required_tasks: tuple[SupportedTask, ...] = ("generate",)
+    required_tasks: tuple[SupportedTask, ...] = ("generate", "token_classify")
 
     def __init__(self):
         self.needs_state = False

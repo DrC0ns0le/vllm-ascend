@@ -381,6 +381,7 @@ def test_prefix_warming_conditions(server, hybrid, enabled, count, long_state, e
         (None, ("generate",), False),
         ([], ("generate",), False),
         (["ascend_structured_decisions"], ("generate",), True),
+        (["ascend_structured_decisions"], ("token_classify",), True),
         (["ascend_structured_decisions"], ("embed",), False),
     ],
 )

@@ -27,6 +27,18 @@
 # ----------------------------------------------------------------------------------
 
 # What's Patched and how it works:
+# Clef-Flash compatibility (vLLM 0.30):
+# - platform/patch_clef.py registers the qwen3_5 config converter lazily from
+#   NPUPlatform.pre_register_and_update. A joint_head_config.json sidecar
+#   selects ClefFlashForJointSchema; ordinary Qwen checkpoints are unchanged.
+# - worker/patch_clef.py lets the explicitly selected joint_head.safetensors
+#   load independently of the backbone's model.safetensors.index.json.
+#   Without this, v0.30 filters out the secondary weights or reports missing
+#   backbone shards. No other weight patterns are affected.
+# Both changes backport behavior already in upstream vLLM. Remove these
+# patches when the supported vLLM release includes Clef detection and skips
+# index filtering for explicit allow_patterns_overrides. Neither patch runs
+# in the token execution path.
 # --------------------------------
 # * Platform Patch:
 # ==========#
