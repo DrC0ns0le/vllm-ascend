@@ -18,11 +18,11 @@
 # This file is a part of the vllm-ascend project.
 
 import torch
-from vllm.logger import logger
 from vllm.triton_utils import tl, triton
 from vllm.v1.outputs import LogprobsTensors
 
 from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
+from vllm_ascend.ops.triton.v2.sample.fill_logprob_token_idx import _fill_logprob_token_ids_kernel
 
 
 @triton.jit
@@ -116,26 +116,67 @@ def _ranks_kernel(
             tl.store(output_ptr + req_idx, n)
 
 
-def compute_topk_logprobs(
+def compute_topk_scores(
     logits: torch.Tensor,
     num_logprobs: int,
     sampled_token_ids: torch.Tensor,
-    cu_num_logits: list[int] | None = None,
+    cu_num_logits: list[int] | torch.Tensor | None = None,
     logprob_token_ids_state=None,
     expanded_idx_mapping: torch.Tensor | None = None,
     max_per_req_token_ids: int = 0,
+    logits_mode: bool = False,
 ) -> LogprobsTensors:
     assert num_logprobs >= 0
     batch_size, vocab_size = logits.shape
 
-    if max_per_req_token_ids != 0:
-        logger.warning_once("Custom logprob_token_ids is not supported yet. Falling back to default logprob_token_ids.")
+    if max_per_req_token_ids == 0:
+        # Fast path: no request asked for custom logprob_token_ids.
+        logprob_token_ids = sampled_token_ids.unsqueeze(-1)
+        if num_logprobs > 0:
+            topk_indices = torch.topk(logits, num_logprobs, dim=-1).indices
+            logprob_token_ids = torch.cat((logprob_token_ids, topk_indices), dim=1)
+        if logits_mode:
+            scores = logits.gather(-1, logprob_token_ids).to(torch.float32)
+        else:
+            scores = compute_token_logprobs(logits, logprob_token_ids)
+    else:
+        # Some requests specified logprob_token_ids. Build the [batch_size,
+        # 1 + max_cols] token_ids matrix and validity mask on the GPU via a
+        # single triton kernel, overriding the topk columns with per-request
+        # tokens where applicable.
+        assert logprob_token_ids_state is not None
+        assert expanded_idx_mapping is not None
 
-    logprob_token_ids = sampled_token_ids.unsqueeze(-1)
-    if num_logprobs > 0:
-        topk_indices = torch.topk(logits, num_logprobs, dim=-1).indices
-        logprob_token_ids = torch.cat((logprob_token_ids, topk_indices), dim=1)
-    logprobs = compute_token_logprobs(logits, logprob_token_ids)
+        if num_logprobs > 0:
+            topk_token_ids = torch.topk(logits, num_logprobs, dim=-1).indices
+            topk_token_ids = topk_token_ids.to(torch.int32)
+        else:
+            # This tensor just used as an int32 pointer, data not accessed.
+            topk_token_ids = logprob_token_ids_state.token_ids.gpu
+
+        num_cols = max(num_logprobs, max_per_req_token_ids)
+        logprob_token_ids = sampled_token_ids.new_zeros((batch_size, 1 + num_cols))
+        valid_mask = torch.zeros_like(logprob_token_ids, dtype=torch.bool)
+        _fill_logprob_token_ids_kernel[(batch_size,)](
+            logprob_token_ids,
+            logprob_token_ids.stride(0),
+            valid_mask,
+            valid_mask.stride(0),
+            sampled_token_ids,
+            topk_token_ids,
+            topk_token_ids.stride(0),
+            expanded_idx_mapping,
+            logprob_token_ids_state.num_token_ids.gpu,
+            logprob_token_ids_state.token_ids.gpu,
+            logprob_token_ids_state.token_ids.gpu.stride(0),
+            NUM_TOPK=num_logprobs,
+            PADDED_COLS=triton.next_power_of_2(num_cols),
+        )
+        if logits_mode:
+            scores = logits.gather(-1, logprob_token_ids).to(torch.float32)
+        else:
+            scores = compute_token_logprobs(logits, logprob_token_ids)
+        scores = scores.masked_fill(~valid_mask, float("-inf"))
 
     token_ranks = torch.empty(
         batch_size,
@@ -161,9 +202,15 @@ def compute_topk_logprobs(
         multibuffer=False,
     )
 
+    is_tensor = isinstance(cu_num_logits, torch.Tensor)
     return LogprobsTensors(
         logprob_token_ids=logprob_token_ids,
-        logprobs=logprobs,
+        logprobs=scores,
         selected_token_ranks=token_ranks,
-        cu_num_generated_tokens=cu_num_logits,
+        cu_num_generated_tokens=None if is_tensor else cu_num_logits,
+        cu_num_generated_tokens_tensor=cu_num_logits if is_tensor else None,
     )
+
+
+# Compatibility with vLLM versions before compute_topk_scores was introduced.
+compute_topk_logprobs = compute_topk_scores

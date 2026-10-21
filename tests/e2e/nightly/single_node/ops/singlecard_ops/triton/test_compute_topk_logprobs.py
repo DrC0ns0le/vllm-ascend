@@ -1,8 +1,10 @@
+from types import SimpleNamespace
+
 import pytest
 import torch
 
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
-from vllm_ascend.worker.v2.sample.logprob import compute_topk_logprobs
+from vllm_ascend.worker.v2.sample.logprob import compute_topk_logprobs, compute_topk_scores
 
 
 @pytest.mark.parametrize(
@@ -59,3 +61,53 @@ def test_compute_topk_logprobs(batch_size, vocab_size, num_logprobs):
         f"Logprobs values differ between Triton and PyTorch.\n"
         f"Max diff: {torch.max(torch.abs(triton_output.logprobs - ref_logprobs))}"
     )
+
+
+@pytest.mark.parametrize("num_logprobs", [0, 2, 4])
+@pytest.mark.parametrize("logits_mode", [False, True])
+@pytest.mark.parametrize("tensor_boundaries", [False, True])
+def test_custom_label_logprobs(num_logprobs, logits_mode, tensor_boundaries):
+    """Mixed requests and reordered/expanded rows retain exact label scores."""
+    init_device_properties_triton()
+    logits = torch.tensor(
+        [
+            [1.0, 5.0, -3.0, 2.0, 0.0, 4.0],
+            [3.0, 0.0, 2.0, 1.0, 5.0, -1.0],
+            [0.0, -1.0, 1.0, 5.0, 2.0, 3.0],
+            [4.0, 3.0, 2.0, 1.0, 0.0, -1.0],
+        ],
+        device="npu",
+    )
+    sampled = logits.argmax(-1)
+    # Request 0 asks for low probability labels; request 1 uses ordinary top-k.
+    # Request 2 asks for one token. A speculative row repeats request 0.
+    state = SimpleNamespace(
+        num_token_ids=SimpleNamespace(gpu=torch.tensor([3, 0, 1], device="npu", dtype=torch.int32)),
+        token_ids=SimpleNamespace(gpu=torch.tensor([[2, 4, 0], [0, 0, 0], [5, 0, 0]], device="npu", dtype=torch.int32)),
+    )
+    mapping = torch.tensor([2, 0, 1, 0], device="npu", dtype=torch.int32)
+    boundaries = [0, 1, 2, 4]
+    cu = torch.tensor(boundaries, device="npu", dtype=torch.int32) if tensor_boundaries else boundaries
+    result = compute_topk_scores(
+        logits,
+        num_logprobs,
+        sampled,
+        cu_num_logits=cu,
+        logprob_token_ids_state=state,
+        expanded_idx_mapping=mapping,
+        max_per_req_token_ids=3,
+        logits_mode=logits_mode,
+    )
+    scores = logits if logits_mode else logits.log_softmax(-1)
+    topk = logits.topk(num_logprobs, dim=-1).indices
+    for row, custom in enumerate(([5], [2, 4, 0], None, [2, 4, 0])):
+        selected = topk[row].tolist() if custom is None else custom
+        ids = [sampled[row].item(), *selected]
+        assert result.logprob_token_ids[row, : len(ids)].tolist() == ids
+        torch.testing.assert_close(result.logprobs[row, : len(ids)], scores[row, ids])
+        assert torch.isneginf(result.logprobs[row, len(ids) :]).all()
+    if tensor_boundaries:
+        assert result.cu_num_generated_tokens is None
+        assert result.cu_num_generated_tokens_tensor is cu
+    else:
+        assert result.cu_num_generated_tokens == boundaries

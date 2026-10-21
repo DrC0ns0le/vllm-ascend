@@ -504,6 +504,9 @@ setup(
     cmdclass=cmdclass,
     extras_require={},
     entry_points={
+        "vllm.endpoint_plugins": [
+            "ascend_structured_decisions = vllm_ascend.entrypoints.plugin:StructuredDecisionsPlugin",
+        ],
         "vllm.platform_plugins": ["ascend = vllm_ascend:register"],
         "vllm.general_plugins": [
             "ascend_kv_connector = vllm_ascend:register_connector",

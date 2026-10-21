@@ -30,7 +30,7 @@ from vllm_ascend.ops.triton.v2.sample.thinking_budget import (
 from vllm_ascend.worker.v2.sample.apply_top_k_top_p import apply_top_k_top_p_npu
 from vllm_ascend.worker.v2.sample.bad_words import apply_bad_words
 from vllm_ascend.worker.v2.sample.gumbel import apply_temperature
-from vllm_ascend.worker.v2.sample.logprob import compute_token_logprobs, compute_topk_logprobs
+from vllm_ascend.worker.v2.sample.logprob import compute_token_logprobs, compute_topk_scores
 from vllm_ascend.worker.v2.sample.min_p import apply_min_p
 from vllm_ascend.worker.v2.sample.penalties import apply_penalties, bincount
 from vllm_ascend.worker.v2.spec_decode.rejection_sampler_utils import (
@@ -40,9 +40,15 @@ from vllm_ascend.worker.v2.spec_decode.rejection_sampler_utils import (
 # triton ops that need to be filed in ops/triton
 penalties.apply_penalties = apply_penalties
 # because sampler.py and speculator.py are imported before this patch, they must be overridden
-prompt_logprob.compute_topk_logprobs = compute_topk_logprobs
-sampler.compute_topk_logprobs = compute_topk_logprobs
-rejection_sampler.compute_topk_logprobs = compute_topk_logprobs
+# vLLM 0.30 renamed this helper and added logits_mode. Patch both the
+# definition and the references imported by consumers before this patch runs.
+logprob.compute_topk_scores = compute_topk_scores
+prompt_logprob.compute_topk_scores = compute_topk_scores
+sampler.compute_topk_scores = compute_topk_scores
+rejection_sampler.compute_topk_scores = compute_topk_scores
+prompt_logprob.compute_topk_logprobs = compute_topk_scores
+sampler.compute_topk_logprobs = compute_topk_scores
+rejection_sampler.compute_topk_logprobs = compute_topk_scores
 states.apply_min_p = apply_min_p
 penalties.bincount = bincount
 bad_words.apply_bad_words = apply_bad_words
