@@ -358,6 +358,22 @@ class TestAscendConfig(TestBase):
         self.assertFalse(ascend_config.rl_config.enabled)
 
     @_clean_up_ascend_config
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_init_ascend_config_preserves_native_prefill_graph_options(self, mock_fix_incompatible_config):
+        test_vllm_config = VllmConfig()
+        options = {
+            "native_prefill_graph": True,
+            "native_prefill_graph_max_context": 1024,
+            "native_prefill_graph_request_counts": [1, 2, 4, 8],
+        }
+        test_vllm_config.additional_config = options.copy()
+
+        ascend_config = init_ascend_config(test_vllm_config)
+
+        self.assertIsNotNone(ascend_config)
+        self.assertEqual(test_vllm_config.additional_config, options)
+
+    @_clean_up_ascend_config
     @patch("vllm_ascend.ascend_config.logger")
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
     def test_init_ascend_config_warns_unsupported_prefill_backend(self, mock_fix_incompatible_config, mock_logger):

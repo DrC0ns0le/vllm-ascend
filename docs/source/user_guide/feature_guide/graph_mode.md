@@ -436,6 +436,13 @@ VLLM_USE_V2_MODEL_RUNNER=0 vllm serve Qwen/Qwen3.5-2B \
   --additional-config '{"native_prefill_graph":true,"native_prefill_graph_max_context":1024,"native_prefill_graph_request_counts":[1,2,4,8]}'
 ```
 
+`FULL_DECODE_ONLY` controls the standard graph dispatcher in this example.
+The native prefill registry separately captures full-model NPU graphs at
+startup and replays eligible fresh prefills before the standard graph path.
+Thus decode and eligible prefills both use graphs. Prefills that the native
+registry cannot handle fall back to the standard non-graph prefill path in
+this configuration.
+
 | Additional configuration | Default | Meaning |
 | --- | --- | --- |
 | `native_prefill_graph` | `false` | Enable startup capture of the prefill registry on MRV1. |
