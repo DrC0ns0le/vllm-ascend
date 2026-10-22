@@ -22,9 +22,10 @@ class Mode(Enum):
     FULL = 1
     FULL_AND_PIECEWISE = 2
     FULL_DECODE_ONLY = 3
+    PIECEWISE = 4
 
     def has_full_cudagraphs(self):
-        return self != Mode.NONE
+        return self not in (Mode.NONE, Mode.PIECEWISE)
 
 
 class GDNAttentionMetadata(SimpleNamespace):
@@ -319,7 +320,8 @@ def load_runner_method(name, namespace):
     return namespace[name]
 
 
-def test_runner_keeps_standard_capture_and_adds_prefill_afterward():
+@pytest.mark.parametrize("standard_bytes", [0, 10])
+def test_runner_keeps_standard_capture_and_adds_prefill_afterward(standard_bytes):
     events = []
     native = SimpleNamespace(enabled=True, warming=False, ready=False)
     runner = SimpleNamespace(native_prefill_graph=native, encoder_cudagraph_manager=None)
@@ -335,11 +337,11 @@ def test_runner_keeps_standard_capture_and_adds_prefill_afterward():
         "_get_gpu_model_runner_module_name": lambda runner: "test",
         "_torch_cuda_wrapper": nullcontext,
         "_replace_gpu_model_runner_function_wrapper": lambda name: nullcontext(),
-        "GPUModelRunner": SimpleNamespace(capture_model=lambda runner: events.append("standard") or 10),
+        "GPUModelRunner": SimpleNamespace(capture_model=lambda runner: events.append("standard") or standard_bytes),
         "torch": SimpleNamespace(npu=SimpleNamespace(mem_get_info=Mock(side_effect=[(100, 200), (80, 200)]))),
         "CUDAGraphMode": Mode,
     }
-    assert load_runner_method("capture_model", namespace)(runner) == 30
+    assert load_runner_method("capture_model", namespace)(runner) == standard_bytes + 20
     assert events == ["standard", "prefill"]
     assert not native.warming
     assert not runner._engram_capture_active
@@ -480,3 +482,94 @@ def test_gdn_native_prefill_uses_zero_initial_state_and_masked_cache_writes(modu
     torch.testing.assert_close(conv_cache[5], expected_history[0])
     torch.testing.assert_close(conv_cache[2], expected_history[1])
     assert torch.count_nonzero(output[~valid]) == 0
+
+
+@pytest.mark.parametrize("mode", [Mode.NONE, Mode.PIECEWISE, Mode.FULL_DECODE_ONLY])
+def test_clef_pooling_has_independent_backbone_registry(modules, mode):
+    cfg = config()
+    cfg.model_config.architecture = "ClefFlashForJointSchema"
+    cfg.model_config.runner_type = "pooling"
+    cfg.compilation_config.cudagraph_mode = mode
+    # NONE can clear the standard dispatcher's capture sizes during config init.
+    cfg.compilation_config.cudagraph_capture_sizes = []
+    owner = modules.runtime.NativePrefillGraphCache(cfg)
+    assert owner.enabled and owner.plan.shapes
+    assert owner.plan.widths == (1, 32)
+    assert cfg.compilation_config.cudagraph_mode == mode
+
+
+@pytest.mark.parametrize(
+    "architecture,runner,eager,model_type",
+    [
+        ("Qwen3_5ForConditionalGeneration", "generate", False, "qwen3_5_text"),
+        ("OtherPoolingModel", "pooling", False, "qwen3_5_text"),
+        ("ClefFlashForJointSchema", "generate", False, "qwen3_5_text"),
+        ("ClefFlashForJointSchema", "pooling", True, "qwen3_5_text"),
+        ("ClefFlashForJointSchema", "pooling", False, "qwen3_5_moe_text"),
+    ],
+)
+def test_clef_exception_does_not_relax_other_graph_guards(modules, architecture, runner, eager, model_type):
+    cfg = config()
+    cfg.compilation_config.cudagraph_mode = Mode.NONE
+    cfg.model_config.architecture = architecture
+    cfg.model_config.runner_type = runner
+    cfg.model_config.enforce_eager = eager
+    cfg.model_config.hf_text_config.model_type = model_type
+    with pytest.raises(ValueError, match="Native prefill graphs require"):
+        modules.runtime.NativePrefillGraphCache(cfg)
+
+
+def test_clef_forward_capture_excludes_pooler_and_preserves_all_rows(modules, monkeypatch):
+    cfg = config()
+    cfg.model_config.architecture = "ClefFlashForJointSchema"
+    cfg.model_config.runner_type = "pooling"
+    cfg.compilation_config.cudagraph_mode = Mode.NONE
+    cfg.compilation_config.cudagraph_capture_sizes = []
+    owner = modules.runtime.NativePrefillGraphCache(cfg)
+    stream = Mock()
+    monkeypatch.setattr(
+        torch,
+        "npu",
+        SimpleNamespace(
+            get_device_name=lambda: "Ascend910B",
+            Stream=lambda: stream,
+            current_stream=lambda: stream,
+            stream=lambda stream: nullcontext(),
+            NPUGraph=Mock,
+            graph=lambda *a, **k: nullcontext(),
+        ),
+        raising=False,
+    )
+
+    class Backbone(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.pooler = Mock(side_effect=AssertionError("Pooler must not run inside backbone capture"))
+
+        def forward(self, input_ids, **kwargs):
+            return torch.stack([input_ids, input_ids + 100], dim=-1).float()
+
+    model = Backbone()
+    runner = SimpleNamespace(model=model, native_prefill_graph=owner, enable_enpu=False)
+    source = context()
+    source.cudagraph_runtime_mode = Mode.NONE
+    namespace = {
+        "get_forward_context": lambda: source,
+        "CUDAGraphMode": Mode,
+        "partial": partial,
+        "ACLGraphWrapper": type("Wrapper", (), {}),
+        "BreakableACLGraphWrapper": type("Breakable", (), {}),
+    }
+    forward = load_runner_method("_model_forward", namespace)
+    owner.warming = True
+    forward(runner, 8, **inputs())
+    owner.warming = False
+    assert owner.ready
+    # Simulate device graph replay on CPU, with the same owned input/output buffers.
+    for entry in owner.entries.values():
+        entry.graph.replay.side_effect = lambda entry=entry: entry.output.copy_(entry.execute(model))
+    actual = forward(runner, 8, **inputs())
+    torch.testing.assert_close(actual[:5], model(**inputs())[:5])
+    assert actual.shape == (8, 2)  # All valid tokens reach pooling, not just last tokens.
+    assert sum(entry.replays for entry in owner.entries.values()) > 0
+    model.pooler.assert_not_called()

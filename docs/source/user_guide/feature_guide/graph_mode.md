@@ -464,6 +464,21 @@ generated tokens against standard v0.30 execution and tests masked state writes
 with padded physical cache strides. NPU correctness, memory use, and performance
 must be validated on the deployment hardware before claiming a speedup.
 
+### Clef-Flash pooling
+
+Clef's independent native registry captures the Qwen3.5 backbone only; the
+schema-dependent pooling head executes afterward outside the graph. vLLM 0.30
+can downgrade the standard FULL mode to PIECEWISE for pooling. Clef therefore
+also permits standard `NONE` / `PIECEWISE` with native prefill explicitly enabled;
+the other native hardware and parallelism restrictions still apply.
+Use `mode=0,cudagraph_mode=NONE` for initial validation without standard graph
+capture, and do not set `enforce_eager`.
+
+See the [Clef runbook](../../tutorials/models/Clef_Flash.md) and
+`tests/e2e/pull_request/one_card/aclgraph/test_clef_native_prefill.py`. The NPU
+acceptance test requires real-weight probability parity and increasing native
+replay counters; successful startup alone does not verify capture correctness.
+
 ## References
 
 - [CUDA Graphs](https://docs.vllm.ai/en/latest/design/cuda_graphs/)

@@ -154,3 +154,43 @@ CPU 单元测试位于 `tests/ut/entrypoints/structured_decisions/test_clef_*.py
 本移植不在 NPU 热路径逐 token 调用 `item()`；schema 索引在 CPU 构造后批量异步传输。
 请分别记录 TP、prompt 长度、问题数、选项数、并发数、首请求和稳定态延迟，
 完成真权重验证后再评估部署容量。
+
+## Native prefill graph（910B / MRV1，待实机验收）
+
+vLLM 0.30 会将 pooling 模型的标准 FULL 模式降级到 PIECEWISE。
+旧的 native prefill 校验仍要求标准 FULL，因而在加载权重后抛出
+`Native prefill graphs require dense Qwen3.5 with FULL graph support enabled`。
+这发生在捕获前，不能据此判断 NPU 算子是否可捕获。
+
+Clef 继承的 Qwen3.5 `forward` 只返回所有 token 的 hidden states。
+独立 native registry 可捕获这个完整主干 forward；runner 随后在图外执行
+`AllPool`、schema 索引构造、词向量查表和 joint head。当前实现不捕获整个决策流水线，
+也不强制绕过上游针对 pooling 的标准 FULL 限制。
+
+本分支允许 Clef pooling 的独立 native registry 与标准 `NONE` / `PIECEWISE`
+共存。首次验证建议在上面的部署命令中增加：
+
+```bash
+# 设置在 vllm serve 命令之前；保留原 VLLM_PLUGINS。
+export VLLM_USE_V2_MODEL_RUNNER=0
+# 追加以下 vllm serve 参数：
+# --mamba-cache-mode none
+# --compilation-config '{"mode":0,"cudagraph_mode":"NONE"}'
+# --additional-config '{"native_prefill_graph":true,"native_prefill_graph_max_context":1024,"native_prefill_graph_request_counts":[1,4]}'
+```
+
+`NONE` 仅关闭标准 dispatcher 的图；显式启用的 native registry 仍在启动时捕获主干。
+不要设置 `--enforce-eager`，它会禁止启动捕获。保持 TP/PP/DP/PCP/DCP=1、
+无量化、无 LoRA、无 speculative decoding、无 KV transfer。该 registry 目前只针对 910B。
+初始验证保持 `--no-enable-chunked-prefill`；超出 native 容量或续接 prefill 的请求回落原路径。
+
+实际验收命令：
+
+```bash
+pytest -sv tests/e2e/pull_request/one_card/aclgraph/test_clef_native_prefill.py
+```
+
+测试用真实 9B 权重比较 eager 与 native 路径的选项概率，验证不同 schema、单请求、
+不等长批次、重复 replay、超长回落及 head 的图外执行；必须同时看到 registry sealed、
+replay 计数增长、概率一致性通过。CPU 回归仅验证控制流和 token 行还原，
+不能证明 torch-npu/CANN 的实际 capture/replay 可用。当前无 NPU，以上实机测试尚未运行。

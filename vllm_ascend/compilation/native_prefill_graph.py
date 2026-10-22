@@ -153,12 +153,28 @@ class NativePrefillGraphCache:
         if not self.enabled:
             return
         text_config = config.model_config.hf_text_config
+        # vLLM 0.30 downgrades FULL to PIECEWISE for pooling models. Clef's
+        # inherited Qwen3.5 forward returns all token hidden states; its
+        # schema-dependent pooler runs later in the runner, outside this
+        # registry. Its backbone capture therefore does not need the standard
+        # dispatcher to support FULL (or to capture any graphs at all).
+        clef_pooling = (
+            getattr(config.model_config, "architecture", None) == "ClefFlashForJointSchema"
+            and getattr(config.model_config, "runner_type", None) == "pooling"
+        )
         if (
             getattr(text_config, "model_type", "") not in ("qwen3_5", "qwen3_5_text")
             or config.model_config.enforce_eager
-            or not config.compilation_config.cudagraph_mode.has_full_cudagraphs()
+            or (not clef_pooling and not config.compilation_config.cudagraph_mode.has_full_cudagraphs())
         ):
-            raise ValueError("Native prefill graphs require dense Qwen3.5 with FULL graph support enabled")
+            raise ValueError(
+                "Native prefill graphs require non-eager dense Qwen3.5 with FULL graph support enabled, "
+                "or ClefFlashForJointSchema with runner=pooling (backbone capture only). "
+                f"Got model_type={getattr(text_config, 'model_type', None)}, "
+                f"runner={getattr(config.model_config, 'runner_type', None)}, "
+                f"cudagraph_mode={config.compilation_config.cudagraph_mode}, "
+                f"enforce_eager={config.model_config.enforce_eager}"
+            )
         if (
             any(
                 getattr(config.parallel_config, field, 1) != 1

@@ -50,5 +50,11 @@ class TestStaticKernelRuntime(unittest.TestCase):
             namespace["_initialize_static_kernel_runtime"](config)
 
         blacklist.assert_called_once_with(
-            ["TopKV2", "GenericBlockSparseAttn", "QuantBatchMatmulV3", "TransposeQuantBatchMatMul", "QuantLightningIndexer"]
+            [
+                "TopKV2",
+                "GenericBlockSparseAttn",
+                "QuantBatchMatmulV3",
+                "TransposeQuantBatchMatMul",
+                "QuantLightningIndexer",
+            ]
         )
