@@ -1864,6 +1864,7 @@ def init_ascend_config(vllm_config: VllmConfig) -> AscendConfig:
         "native_prefill_graph",
         "native_prefill_graph_max_context",
         "native_prefill_graph_request_counts",
+        "native_prefill_graph_context_sizes",
         # injected fields (factory passes explicitly; a copy in additional_config would conflict)
         "scheduler_config",
         "sparse_kv_offload_config",

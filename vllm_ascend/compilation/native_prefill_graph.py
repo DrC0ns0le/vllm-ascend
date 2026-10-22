@@ -150,6 +150,7 @@ class NativePrefillGraphCache:
         self.ready = False
         self.warming = False
         self.entries = {}
+        self._reported_fallbacks: set[str] = set()
         if not self.enabled:
             return
         text_config = config.model_config.hf_text_config
@@ -208,6 +209,7 @@ class NativePrefillGraphCache:
             config.scheduler_config.max_num_seqs,
             capacity,
             options.get("native_prefill_graph_request_counts"),
+            options.get("native_prefill_graph_context_sizes"),
         )
 
     def warmup(self, context, inputs, runnable):
@@ -259,20 +261,37 @@ class NativePrefillGraphCache:
         )
         return next(iter(self.entries.values())).output[: inputs["positions"].shape[-1]].clone()
 
+    def _fallback(self, reason, attention=None):
+        # Only host metadata is inspected. Log each reason once per registry,
+        # without device synchronization or per-request INFO logging overhead.
+        if reason not in self._reported_fallbacks:
+            self._reported_fallbacks.add(reason)
+            logger.info(
+                "Native prefill fallback: reason=%s state=%s actual_tokens=%s max_context=%d "
+                "(first occurrence; using standard forward)",
+                reason,
+                getattr(attention, "attn_state", None),
+                getattr(attention, "num_actual_tokens", None),
+                self.plan.widths[-1],
+            )
+        return None
+
     def replay(self, context, inputs):
         """Return None before any mutation when the standard path must run."""
-        if not self.ready or context.attn_metadata is None or context.capturing:
+        if not self.ready or context.capturing:
             return None
+        if context.attn_metadata is None:
+            return self._fallback("missing_attention_metadata")
         attention = next(
             (metadata for metadata in context.attn_metadata.values() if type(metadata).__name__ == "AscendMetadata"),
             None,
         )
-        if (
-            attention is None
-            or attention.attn_state != AscendAttentionState.PrefillNoCache
-            or attention.num_actual_tokens == 0
-        ):
-            return None
+        if attention is None:
+            return self._fallback("missing_ascend_metadata")
+        if attention.attn_state != AscendAttentionState.PrefillNoCache:
+            return self._fallback("not_fresh_prefill", attention)
+        if attention.num_actual_tokens == 0:
+            return self._fallback("empty_batch", attention)
         actual = attention.num_actual_tokens
         boundaries = [0]
         for end in attention.actual_seq_lengths_q:
@@ -280,20 +299,40 @@ class NativePrefillGraphCache:
                 break
             boundaries.append(end)
         if boundaries[-1] != actual:
-            return None
-        batches = self.plan.batches(boundaries, attention.seq_lens_list[: len(boundaries) - 1])
+            return self._fallback("query_boundaries", attention)
+        totals = attention.seq_lens_list[: len(boundaries) - 1]
+        batches = self.plan.batches(boundaries, totals)
         if not batches:
-            return None
+            lengths = [end - start for start, end in zip(boundaries, boundaries[1:])]
+            if any(total != length for total, length in zip(totals, lengths)):
+                reason = "cached_context"
+            elif any(length > self.plan.widths[-1] for length in lengths):
+                reason = "context_capacity"
+            else:
+                reason = "batch_capacity"
+            return self._fallback(reason, attention)
         if any(shape not in self.entries for shape, _ in batches):
             raise RuntimeError("Native prefill startup registry is incomplete")
         if any(not self.entries[shape].accepts(inputs) for shape, _ in batches):
-            return None
+            return self._fallback("input_layout", attention)
         result = None
         for shape, items in batches:
             entry = self.entries[shape]
             output_sources, output_targets = entry.update(context, inputs, items)
             entry.graph.replay()
             entry.replays += 1
+            if entry.replays == 1:
+                actual_tokens = sum(item.length for item in items)
+                logger.info(
+                    "Native prefill first replay: requests=%d captured_requests=%d width=%d "
+                    "actual_tokens=%d captured_tokens=%d padding_ratio=%.2f",
+                    len(items),
+                    shape.requests,
+                    shape.width,
+                    actual_tokens,
+                    shape.tokens,
+                    shape.tokens / actual_tokens,
+                )
             if result is None:
                 result = entry.output.new_zeros((inputs["positions"].shape[-1], *entry.output.shape[1:]))
             result.index_copy_(0, output_targets, entry.output.index_select(0, output_sources))

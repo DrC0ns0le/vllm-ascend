@@ -448,15 +448,29 @@ this configuration.
 | `native_prefill_graph` | `false` | Enable startup capture of the prefill registry on MRV1. |
 | `native_prefill_graph_max_context` | `min(max_model_len, 1024)` | Maximum fresh query width; positive integer no larger than `max_model_len`. |
 | `native_prefill_graph_request_counts` | Powers of two up to `max_num_seqs`, plus `max_num_seqs` | Nonempty list of positive request counts no larger than `max_num_seqs`. |
+| `native_prefill_graph_context_sizes` | Standard capture sizes, or powers of two when none are usable | Optional nonempty list of positive per-request query widths within the effective width ceiling. Independent of standard decode capture sizes. |
 
-Widths come from `cudagraph_capture_sizes`, plus width one and the effective
-width ceiling. Every rectangle fits within `max_num_batched_tokens`; groups
+Widths come from `native_prefill_graph_context_sizes` when specified, otherwise
+from `cudagraph_capture_sizes`. If the latter has no usable widths (for example,
+standard `NONE`), powers of two are used to avoid padding every request to the
+maximum context. Width one and the effective width ceiling are always included.
+The ceiling is the smaller of the native context limit and the batch token budget
+divided by the smallest captured request count.
+Every rectangle fits within `max_num_batched_tokens`; groups
 larger than a rectangle are split and their outputs restored to scheduler order.
 The registry is sealed before serving. It never captures a new graph during
 requests. More rectangles increase startup time and graph memory consumption.
 
-Check for `Native prefill registry sealed` at startup and, with debug logging,
-`Native prefill replay hit` during fresh requests. The CPU tests in
+`native_prefill_graph_max_context` can exceed 1024; raise `max_model_len` and
+`max_num_batched_tokens` to accommodate the intended fresh prompt length.
+See the Clef runbook below for an 8192-token configuration. This is a configuration
+example, not a hardware-validated capacity claim.
+
+Check for `Native prefill registry sealed` at startup and `Native prefill first replay`
+at INFO level on each graph's first replay. The latter reports actual/captured
+tokens and their padding ratio. `Native prefill fallback` reports each fallback
+reason once at INFO level; later replay hits remain at DEBUG. A sealed registry
+alone does not prove that serving requests use it. The CPU tests in
 `tests/ut/compilation/native_prefill/` cover geometry, neutral padding, owned
 metadata, replay, and decode exclusion. The real-weight acceptance test is
 `tests/e2e/pull_request/one_card/aclgraph/test_qwen3_5_native_prefill.py`; it compares

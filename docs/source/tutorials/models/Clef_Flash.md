@@ -184,11 +184,44 @@ export VLLM_USE_V2_MODEL_RUNNER=0
 无量化、无 LoRA、无 speculative decoding、无 KV transfer。该 registry 目前只针对 910B。
 初始验证保持 `--no-enable-chunked-prefill`；超出 native 容量或续接 prefill 的请求回落原路径。
 
+1024 是 native 默认上限，不是 Clef 的上下文上限。需要 8k 时，可用以下参数替换
+上面的容量配置（完整 prompt 包括 state、问题和选项；显存及实机正确性尚待验证）：
+
+```bash
+# --max-model-len 8192
+# --max-num-batched-tokens 8192
+# --no-enable-chunked-prefill
+# --additional-config '{"native_prefill_graph":true,"native_prefill_graph_max_context":8192,"native_prefill_graph_request_counts":[1],"native_prefill_graph_context_sizes":[256,512,1024,2048,4096,8192]}'
+```
+
+`native_prefill_graph_context_sizes` 独立控制每个请求的预填充长度桶，必须是非空正整数列表，
+且不超过 native 上限及最小 request count 对应的 token 预算。自动补入宽度 1 和有效上限。
+未指定时沿用标准 capture sizes；若标准列表为空，则使用 2 的幂加上有效上限。
+这修复了标准 NONE 下仅有 `[1, max_context]`、短请求被填充到最大长度的问题。
+`request_counts:[1]` 先限制捕获内存；并发请求会分组逐图 replay。
+后续可测量 `[1,2,4]`，只有 request count × width 不超过 batch token 预算的图才会捕获。
+更多长度桶和请求数会增加启动时间及图内存；16384 上限也可按同样方式配置，但不代表已通过容量验收。
+
+不能仅凭延迟或 `Native prefill registry sealed` 判断请求是否 replay：
+
+- `registry sealed`：启动捕获完成。
+- `Native prefill first replay`：每个图首次实际 replay 后输出 INFO；包含真实/捕获 token 数和
+  `padding_ratio`（捕获 token 数 ÷ 真实 token 数）。后续逐次 hit 使用 DEBUG。
+- `Native prefill fallback`：每类原因首次输出 INFO，例如 `context_capacity`（超过长度桶）、
+  `cached_context` / `not_fresh_prefill`（缓存或续接）、`batch_capacity`（批次预算）和
+  `input_layout`（输入布局不兼容）。这些请求仍走标准 forward。
+
+即使确认 replay，padding、图外输入准备/输出拷贝和 eager joint head 仍可能抵消收益。
+比较性能时保持请求、并发、缓存策略和容量一致，仅切换 native 开关。
+
 实际验收命令：
 
 ```bash
 pytest -sv tests/e2e/pull_request/one_card/aclgraph/test_clef_native_prefill.py
 ```
+
+测试分别覆盖 1024 和 4096 native 容量，并单独断言超过 1024 的请求 replay 计数增加、
+概率与 eager 基线一致。尚未在本地执行 NPU 测试。
 
 测试用真实 9B 权重比较 eager 与 native 路径的选项概率，验证不同 schema、单请求、
 不等长批次、重复 replay、超长回落及 head 的图外执行；必须同时看到 registry sealed、

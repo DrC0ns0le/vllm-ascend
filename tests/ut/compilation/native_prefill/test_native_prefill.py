@@ -153,6 +153,37 @@ def test_budget_capacity_and_non_power_of_two_limits(modules):
     assert plan.batches([0, 1, 2, 3, 4, 5, 6], [1] * 6) is None
 
 
+def test_empty_standard_sizes_bucket_long_contexts_without_maximum_padding(modules):
+    plan = modules.layout.NativePrefillPlan([], 16384, 4, 8192, [1, 4])
+    for length, width in [(300, 512), (1025, 2048), (3000, 4096), (8192, 8192)]:
+        batches = plan.batches([0, length], [length])
+        assert len(batches) == 1
+        assert batches[0][0].width == width
+        assert batches[0][0].requests == 1
+    assert plan.batches([0, 8193], [8193]) is None
+    assert all(shape.tokens <= 16384 for shape in plan.shapes)
+
+
+def test_explicit_context_sizes_are_independent_of_standard_capture(modules):
+    cfg = config()
+    cfg.model_config.max_model_len = 8192
+    cfg.scheduler_config.max_num_batched_tokens = 8192
+    cfg.additional_config.update(
+        native_prefill_graph_max_context=8192,
+        native_prefill_graph_context_sizes=[256, 512, 1024, 2048, 4096],
+    )
+    cache = modules.runtime.NativePrefillGraphCache(cfg)
+    assert cache.plan.widths == (1, 256, 512, 1024, 2048, 4096, 8192)
+    shape, _ = cache.plan.batches([0, 3000], [3000])[0]
+    assert shape.width == 4096
+
+
+@pytest.mark.parametrize("sizes", [[], [0], [-1], [True], [1.5], [8193], "1024"])
+def test_invalid_native_context_sizes_fail(modules, sizes):
+    with pytest.raises(ValueError, match="native_prefill_graph_context_sizes"):
+        modules.layout.NativePrefillPlan([], 8192, 4, 8192, [1], sizes)
+
+
 def test_padding_preserves_recurrent_state_and_real_outputs(modules):
     generator = torch.Generator().manual_seed(12)
     real_tokens, padded_tokens = 3, 8
@@ -236,6 +267,90 @@ def test_replay_scatter_restores_token_order_and_reuses_sealed_registry(modules)
         assert output[:, 0].tolist() == [0, 1, 2, 3, 4, 0, 0, 0]
     assert tuple(owner.entries) == registry
     assert sum(entry.replays for entry in owner.entries.values()) == 3
+
+
+def test_first_replay_reports_actual_and_padded_tokens_once(modules):
+    owner, source, model_inputs = make_replay_cache(modules)
+    for _ in range(3):
+        owner.replay(source, model_inputs)
+    modules.runtime.logger.info.assert_called_once_with(
+        "Native prefill first replay: requests=%d captured_requests=%d width=%d "
+        "actual_tokens=%d captured_tokens=%d padding_ratio=%.2f",
+        2,
+        2,
+        4,
+        5,
+        8,
+        8 / 5,
+    )
+
+
+def test_long_prefill_replay_preserves_every_token(modules):
+    cfg = config()
+    cfg.model_config.max_model_len = 8192
+    cfg.scheduler_config.max_num_batched_tokens = 8192
+    cfg.compilation_config.cudagraph_capture_sizes = []
+    cfg.additional_config["native_prefill_graph_max_context"] = 8192
+    owner = modules.runtime.NativePrefillGraphCache(cfg)
+    source, model_inputs = context((3000,)), inputs(3000)
+    shape, _ = owner.plan.batches([0, 3000], [3000])[0]
+    entry = modules.runtime.NativePrefillEntry(owner, shape, source, model_inputs)
+    entry.output = torch.zeros((shape.tokens, 1), dtype=torch.long)
+    entry.graph = SimpleNamespace(
+        replay=Mock(side_effect=lambda: entry.output.copy_(entry.inputs["input_ids"][:, None]))
+    )
+    owner.entries[shape] = entry
+    owner.ready = True
+    for offset in (0, 1):
+        model_inputs["input_ids"] = torch.arange(3000) + offset
+        output = owner.replay(source, model_inputs)
+        torch.testing.assert_close(output[:, 0], model_inputs["input_ids"])
+    assert entry.replays == 2
+    assert shape.width == 4096
+
+
+@pytest.mark.parametrize(
+    "case,reason",
+    [
+        ("cached", "cached_context"),
+        ("long", "context_capacity"),
+        ("batch", "batch_capacity"),
+        ("decode", "not_fresh_prefill"),
+        ("inputs", "input_layout"),
+        ("boundaries", "query_boundaries"),
+        ("empty", "empty_batch"),
+        ("missing", "missing_attention_metadata"),
+        ("gdn_only", "missing_ascend_metadata"),
+    ],
+)
+def test_fallback_reports_reason_once_without_mutation(modules, case, reason):
+    owner, source, model_inputs = make_replay_cache(modules)
+    attention = source.attn_metadata["attention"]
+    if case == "cached":
+        attention.seq_lens_list = [10, 9]
+    elif case == "long":
+        source = context((33,))
+    elif case == "batch":
+        source = context((20, 20))
+    elif case == "decode":
+        attention.attn_state = "decode"
+    elif case == "inputs":
+        model_inputs["extra"] = torch.zeros(1)
+    elif case == "boundaries":
+        attention.actual_seq_lengths_q = [3, 6]
+    elif case == "empty":
+        attention.num_actual_tokens = 0
+    elif case == "missing":
+        source.attn_metadata = None
+    elif case == "gdn_only":
+        del source.attn_metadata["attention"]
+    for entry in owner.entries.values():
+        entry.update = Mock(side_effect=AssertionError("Fallback must not mutate inputs"))
+    for _ in range(3):
+        assert owner.replay(source, model_inputs) is None
+    assert all(entry.replays == 0 for entry in owner.entries.values())
+    modules.runtime.logger.info.assert_called_once()
+    assert modules.runtime.logger.info.call_args.args[1] == reason
 
 
 @pytest.mark.parametrize("totals", [(10, 9), (3, 9), (8, 2)])
@@ -494,7 +609,7 @@ def test_clef_pooling_has_independent_backbone_registry(modules, mode):
     cfg.compilation_config.cudagraph_capture_sizes = []
     owner = modules.runtime.NativePrefillGraphCache(cfg)
     assert owner.enabled and owner.plan.shapes
-    assert owner.plan.widths == (1, 32)
+    assert owner.plan.widths == (1, 2, 4, 8, 16, 32)
     assert cfg.compilation_config.cudagraph_mode == mode
 
 

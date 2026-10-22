@@ -365,6 +365,7 @@ class TestAscendConfig(TestBase):
             "native_prefill_graph": True,
             "native_prefill_graph_max_context": 1024,
             "native_prefill_graph_request_counts": [1, 2, 4, 8],
+            "native_prefill_graph_context_sizes": [128, 256, 512, 1024],
         }
         test_vllm_config.additional_config = options.copy()
 

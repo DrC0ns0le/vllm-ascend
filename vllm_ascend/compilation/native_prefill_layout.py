@@ -26,7 +26,7 @@ class PrefillRequest:
 
 
 class NativePrefillPlan:
-    def __init__(self, capture_sizes, max_tokens, max_requests, max_context, request_counts=None):
+    def __init__(self, capture_sizes, max_tokens, max_requests, max_context, request_counts=None, context_sizes=None):
         if min(max_tokens, max_requests, max_context) < 1:
             raise ValueError("Native prefill capacities must be positive")
         if request_counts is None:
@@ -42,7 +42,24 @@ class NativePrefillPlan:
         ceiling = min(max_tokens // self.request_counts[0], max_context)
         if ceiling < 1:
             raise ValueError("Smallest captured request count exceeds the token budget")
-        self.widths = tuple(sorted({1, ceiling} | {size for size in capture_sizes if 0 < size <= ceiling}))
+        if context_sizes is not None:
+            if (
+                not isinstance(context_sizes, (list, tuple))
+                or not context_sizes
+                or any(type(size) is not int or not 0 < size <= ceiling for size in context_sizes)
+            ):
+                raise ValueError(
+                    "native_prefill_graph_context_sizes must contain positive integers "
+                    "within the native context and per-request token budget"
+                )
+            widths = set(context_sizes)
+        else:
+            widths = {size for size in capture_sizes if 0 < size <= ceiling}
+            # Standard NONE can leave capture_sizes empty. Avoid padding every
+            # nontrivial request to the maximum native context in that case.
+            if not widths:
+                widths = {1 << index for index in range(ceiling.bit_length())}
+        self.widths = tuple(sorted({1, ceiling} | widths))
         self.max_tokens = max_tokens
         self.max_requests = max_requests
         self.max_context = max_context
