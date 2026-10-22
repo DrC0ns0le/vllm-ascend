@@ -23,7 +23,6 @@ from typing import Any, cast
 
 import torch
 import torch.fx as fx
-from npugraph_ex._acl_concrete_graph.static_kernel import _set_static_kernel_blacklist
 from torch._dynamo.backends.common import aot_autograd
 from torch._inductor.compile_fx import graph_returns_tuple, make_graph_return_tuple
 from torch._inductor.decomposition import select_decomp_table
@@ -122,6 +121,10 @@ def _initialize_static_kernel_runtime(vllm_config: VllmConfig) -> None:
         ",".join(incompatible_ops),
         scope="global",
     )
+    # Import only after LOCAL_WORLD_SIZE is set: the backend reads runtime
+    # topology during import. Keep this dependency lazy when kernels are off.
+    from npugraph_ex._acl_concrete_graph.static_kernel import _set_static_kernel_blacklist
+
     _set_static_kernel_blacklist(incompatible_ops)
 
 
