@@ -48,6 +48,12 @@ python3 -m vllm.entrypoints.openai.api_server \
 
 > Note: **January 19, 2026: The vLLM mainline has deprecated the VLLM_TORCH_PROFILER_DIR environment variable.** [Related PR](https://github.com/vllm-project/vllm-ascend/pull/5928)  When using the vLLM Ascend mainline code to collect profiler data, remember to use the `--profiler-config` (online) parameter or the `profiler_config` (offline) parameter.
 
+分析矩阵乘法耗时时，可在现有 `--profiler-config` 中加入
+`"torch_profiler_record_shapes": true`，由 Ascend wrapper 传递给 NPU profiler。
+该选项默认关闭；开启后采集 tensor shapes，便于区分不同输入尺寸的算子。
+请保留算子明细中的 shape/type 列，并在关闭 profiler 时单独测量稳定态延迟，
+不要将采集期间的耗时当作服务性能。
+
 ### 2. Start Collection
 
 !!! note
